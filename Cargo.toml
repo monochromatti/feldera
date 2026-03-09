@@ -30,6 +30,7 @@ members = [
   "crates/ir",
   "crates/fxp",
   "crates/storage-test-compat",
+  "crates/buffer-cache",
 ]
 exclude = [
   "sql-to-dbsp-compiler/temp",
@@ -124,6 +125,7 @@ feldera-cloud1-client = "0.1.2"
 feldera-datagen = { path = "crates/datagen" }
 feldera-fxp = { version = "0.263.0", path = "crates/fxp", features = ["dbsp"] }
 feldera-iceberg = { path = "crates/iceberg" }
+feldera-buffer-cache = { version = "0.263.0", path = "crates/buffer-cache" }
 feldera-observability = { version = "0.263.0", path = "crates/feldera-observability" }
 feldera-macros = { version = "0.263.0", path = "crates/feldera-macros" }
 feldera-sqllib = { version = "0.263.0", path = "crates/sqllib" }

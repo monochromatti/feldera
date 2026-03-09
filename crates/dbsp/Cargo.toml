@@ -101,6 +101,7 @@ rmp-serde = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+rand_distr = { workspace = true }
 proptest-derive = { workspace = true }
 proptest = { workspace = true }
 proptest-state-machine = { workspace = true }
@@ -116,6 +117,7 @@ indicatif = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 chrono = { workspace = true, features = ["serde"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+feldera-buffer-cache = { workspace = true }
 
 [[bench]]
 name = "galen"
@@ -143,6 +145,14 @@ harness = false
 
 [[bench]]
 name = "input_map_ingest"
+harness = false
+
+[[bench]]
+name = "buffer_cache_compare"
+harness = false
+
+[[bench]]
+name = "buffer_cache_throughput"
 harness = false
 
 [[bench]]
