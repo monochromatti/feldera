@@ -98,6 +98,7 @@ smallvec = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 rmp-serde = { workspace = true }
+feldera-buffer-cache = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
@@ -117,7 +118,6 @@ indicatif = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 chrono = { workspace = true, features = ["serde"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-feldera-buffer-cache = { workspace = true }
 
 [[bench]]
 name = "galen"

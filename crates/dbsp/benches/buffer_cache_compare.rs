@@ -91,7 +91,7 @@ fn run_sieve(prefill: &[Prefill], trace: &[Op], capacity_bytes: usize) -> RunSta
 }
 
 fn run_lru(prefill: &[Prefill], trace: &[Op], capacity_bytes: usize) -> RunStats {
-    let cache = BufferCache::new(capacity_bytes);
+    let cache = BufferCache::new_lru(capacity_bytes);
     let file = BenchFile::new();
     for p in prefill {
         cache.insert(file.id(), p.offset, Arc::new(LruBenchEntry::new(p.charge)));

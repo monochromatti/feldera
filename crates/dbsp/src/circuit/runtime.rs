@@ -2,7 +2,7 @@
 //! fashion.
 
 use super::CircuitConfig;
-use super::dbsp_handle::{Layout, Mode};
+use super::dbsp_handle::{BufferCacheAllocationStrategy, Layout, Mode};
 use crate::SchedulerError;
 use crate::circuit::DevTweaks;
 use crate::circuit::checkpointer::Checkpointer;
@@ -15,7 +15,11 @@ use crate::storage::file::writer::Parameters;
 use crate::trace::unaligned_deserialize;
 use crate::{
     DetailedError,
-    storage::{backend::StorageError, buffer_cache::BufferCache, dirlock::LockedDirectory},
+    storage::{
+        backend::StorageError,
+        buffer_cache::{BufferCache, BufferCacheStrategy},
+        dirlock::LockedDirectory,
+    },
 };
 use core_affinity::{CoreId, get_core_ids};
 use crossbeam::sync::{Parker, Unparker};
@@ -34,6 +38,7 @@ use std::{
     backtrace::Backtrace,
     borrow::Cow,
     cell::{Cell, RefCell},
+    collections::HashSet,
     error::Error as StdError,
     fmt,
     fmt::{Debug, Display, Error as FmtError, Formatter},
@@ -364,6 +369,9 @@ fn map_pin_cpus(layout: &Layout, pin_cpus: &[usize]) -> Vec<EnumMap<ThreadType, 
 impl RuntimeInner {
     fn new(config: CircuitConfig) -> Result<Self, DbspError> {
         let nworkers = config.layout.local_workers().len();
+        let buffer_cache_strategy = config.dev_tweaks.buffer_cache_strategy;
+        let buffer_max_buckets = config.dev_tweaks.buffer_max_buckets;
+        let buffer_cache_allocation_strategy = config.dev_tweaks.buffer_cache_allocation_strategy;
 
         let storage = if let Some(storage) = config.storage {
             let locked_directory =
@@ -390,16 +398,70 @@ impl RuntimeInner {
         };
 
         let cache_size_bytes = if let Some(storage) = &storage {
-            storage
-                .options
-                .cache_mib
-                .map_or(256 * 1024 * 1024, |cache_mib| {
-                    cache_mib.saturating_mul(1024 * 1024) / nworkers / ThreadType::LENGTH
-                })
+            match storage.options.cache_mib {
+                Some(cache_mib) => {
+                    let total_cache_bytes = cache_mib.saturating_mul(1024 * 1024);
+                    match buffer_cache_strategy {
+                        BufferCacheStrategy::Sieve => match buffer_cache_allocation_strategy {
+                            BufferCacheAllocationStrategy::PerThread => {
+                                total_cache_bytes / nworkers / ThreadType::LENGTH
+                            }
+                            BufferCacheAllocationStrategy::SharedPerWorkerPair => {
+                                total_cache_bytes / nworkers
+                            }
+                            BufferCacheAllocationStrategy::Global => total_cache_bytes,
+                        },
+                        BufferCacheStrategy::Lru => {
+                            total_cache_bytes / nworkers / ThreadType::LENGTH
+                        }
+                    }
+                }
+                None => 256 * 1024 * 1024,
+            }
         } else {
             // Dummy buffer cache.
             1
         };
+
+        let global_sieve_cache = (buffer_cache_strategy == BufferCacheStrategy::Sieve
+            && buffer_cache_allocation_strategy == BufferCacheAllocationStrategy::Global)
+            .then(|| Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets)));
+
+        info!(
+            "Setting up buffer caches: {buffer_cache_strategy:?} {buffer_cache_allocation_strategy:?}",
+        );
+        let buffer_caches = (0..nworkers)
+            .map(|_| match buffer_cache_strategy {
+                BufferCacheStrategy::Sieve
+                    if buffer_cache_allocation_strategy == BufferCacheAllocationStrategy::Global =>
+                {
+                    let cache = global_sieve_cache.as_ref().unwrap().clone();
+                    enum_map! {
+                        ThreadType::Foreground => cache.clone(),
+                        ThreadType::Background => cache.clone(),
+                    }
+                }
+                BufferCacheStrategy::Sieve
+                    if buffer_cache_allocation_strategy
+                        == BufferCacheAllocationStrategy::SharedPerWorkerPair =>
+                {
+                    let cache =
+                        Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets));
+                    enum_map! {
+                        ThreadType::Foreground => cache.clone(),
+                        ThreadType::Background => cache.clone(),
+                    }
+                }
+                BufferCacheStrategy::Sieve => enum_map! {
+                    ThreadType::Foreground => Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets)),
+                    ThreadType::Background => Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets)),
+                },
+                BufferCacheStrategy::Lru => enum_map! {
+                    ThreadType::Foreground => Arc::new(BufferCache::new_lru(cache_size_bytes)),
+                    ThreadType::Background => Arc::new(BufferCache::new_lru(cache_size_bytes)),
+                },
+            })
+            .collect();
 
         Ok(Self {
             pin_cpus: map_pin_cpus(&config.layout, &config.pin_cpus),
@@ -411,9 +473,7 @@ impl RuntimeInner {
             kill_signal: AtomicBool::new(false),
             background_threads: Mutex::new(Vec::new()),
             aux_threads: Mutex::new(Vec::new()),
-            buffer_caches: (0..nworkers)
-                .map(|_| EnumMap::from_fn(|_| Arc::new(BufferCache::new(cache_size_bytes))))
-                .collect(),
+            buffer_caches,
             worker_sequence_numbers: (0..nworkers).map(|_| AtomicUsize::new(0)).collect(),
             panic_info: (0..nworkers)
                 .map(|_| EnumMap::from_fn(|_| RwLock::new(None)))
@@ -612,8 +672,7 @@ impl Runtime {
             })
     }
 
-    /// Returns this thread's buffer cache.  Every thread has a buffer cache,
-    /// but:
+    /// Returns this thread's buffer-cache handle, but:
     ///
     /// - If the thread's [Runtime] does not have storage configured, the cache
     ///   size is trivially small.
@@ -689,8 +748,8 @@ impl Runtime {
             .push((handle, unparker))
     }
 
-    /// Returns this runtime's buffer cache for thread type `thread_type` in
-    /// worker with local offset `local_worker_offset`.
+    /// Returns this runtime's buffer-cache handle for thread type `thread_type`
+    /// in worker with local offset `local_worker_offset`.
     ///
     /// Usually it's easier and faster to call [Runtime::buffer_cache] instead.
     pub fn get_buffer_cache(
@@ -705,10 +764,12 @@ impl Runtime {
     /// that is currently used and its maximum size, both in bytes.
     pub fn cache_occupancy(&self) -> (usize, usize) {
         if self.0.storage.is_some() {
+            let mut seen = HashSet::new();
             self.0
                 .buffer_caches
                 .iter()
                 .flat_map(|map| map.values())
+                .filter(|cache| seen.insert(Arc::as_ptr(cache) as usize))
                 .map(|cache| cache.occupancy())
                 .fold((0, 0), |(a_cur, a_max), (b_cur, b_max)| {
                     (a_cur + b_cur, a_max + b_max)
@@ -1297,18 +1358,30 @@ impl RuntimeHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
+    use super::{Runtime, RuntimeInner, ThreadType};
     use crate::{
         Circuit, RootCircuit,
         circuit::{
-            CircuitConfig, Layout,
+            BufferCacheAllocationStrategy, CircuitConfig, Layout,
             dbsp_handle::{CircuitStorageConfig, DevTweaks, Mode},
             schedule::{DynamicScheduler, Scheduler},
         },
         operator::Generator,
+        storage::{
+            backend::FileId,
+            buffer_cache::{BufferCacheStrategy, CacheEntry},
+        },
     };
     use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
-    use std::{cell::RefCell, rc::Rc, thread::sleep, time::Duration};
+    use std::{cell::RefCell, rc::Rc, sync::Arc, thread::sleep, time::Duration};
+
+    struct TestCacheEntry(usize);
+
+    impl CacheEntry for TestCacheEntry {
+        fn cost(&self) -> usize {
+            self.0
+        }
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)]
@@ -1346,6 +1419,139 @@ mod tests {
         .expect("failed to start runtime");
         hruntime.join().unwrap();
         assert!(path.exists(), "persistent storage is not cleaned up");
+    }
+
+    #[test]
+    fn sieve_uses_separate_caches_per_thread_by_default() {
+        let inner = RuntimeInner::new(CircuitConfig::with_workers(2)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &inner.buffer_caches[0][ThreadType::Foreground],
+            &inner.buffer_caches[0][ThreadType::Background],
+        ));
+        assert!(!Arc::ptr_eq(
+            &inner.buffer_caches[1][ThreadType::Foreground],
+            &inner.buffer_caches[1][ThreadType::Background],
+        ));
+    }
+
+    #[test]
+    fn sieve_can_share_cache_per_worker_pair_when_requested() {
+        let config = CircuitConfig::with_workers(2).with_buffer_cache_allocation_strategy(
+            BufferCacheAllocationStrategy::SharedPerWorkerPair,
+        );
+        let inner = RuntimeInner::new(config).unwrap();
+        assert!(Arc::ptr_eq(
+            &inner.buffer_caches[0][ThreadType::Foreground],
+            &inner.buffer_caches[0][ThreadType::Background],
+        ));
+        assert!(Arc::ptr_eq(
+            &inner.buffer_caches[1][ThreadType::Foreground],
+            &inner.buffer_caches[1][ThreadType::Background],
+        ));
+    }
+
+    #[test]
+    fn sieve_can_share_one_global_cache_when_requested() {
+        let config = CircuitConfig::with_workers(2)
+            .with_buffer_cache_allocation_strategy(BufferCacheAllocationStrategy::Global);
+        let inner = RuntimeInner::new(config).unwrap();
+        let global = inner.buffer_caches[0][ThreadType::Foreground].clone();
+        assert!(Arc::ptr_eq(
+            &global,
+            &inner.buffer_caches[0][ThreadType::Background],
+        ));
+        assert!(Arc::ptr_eq(
+            &global,
+            &inner.buffer_caches[1][ThreadType::Foreground],
+        ));
+        assert!(Arc::ptr_eq(
+            &global,
+            &inner.buffer_caches[1][ThreadType::Background],
+        ));
+    }
+
+    #[test]
+    fn lru_keeps_separate_foreground_and_background_caches() {
+        let config = CircuitConfig::with_workers(2)
+            .with_buffer_cache_strategy(BufferCacheStrategy::Lru)
+            .with_buffer_cache_allocation_strategy(
+                BufferCacheAllocationStrategy::SharedPerWorkerPair,
+            );
+        let inner = RuntimeInner::new(config).unwrap();
+        assert!(!Arc::ptr_eq(
+            &inner.buffer_caches[0][ThreadType::Foreground],
+            &inner.buffer_caches[0][ThreadType::Background],
+        ));
+        assert!(!Arc::ptr_eq(
+            &inner.buffer_caches[1][ThreadType::Foreground],
+            &inner.buffer_caches[1][ThreadType::Background],
+        ));
+    }
+
+    #[test]
+    fn shared_sieve_cache_occupancy_is_not_double_counted() {
+        let path = tempfile::tempdir().unwrap();
+        let storage = CircuitStorageConfig::for_config(
+            StorageConfig {
+                path: path.path().to_string_lossy().into_owned(),
+                cache: StorageCacheConfig::default(),
+            },
+            StorageOptions {
+                cache_mib: Some(8),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        let runtime = Runtime(Arc::new(
+            RuntimeInner::new(
+                CircuitConfig::with_workers(1)
+                    .with_storage(storage)
+                    .with_buffer_cache_allocation_strategy(
+                        BufferCacheAllocationStrategy::SharedPerWorkerPair,
+                    ),
+            )
+            .unwrap(),
+        ));
+
+        runtime.get_buffer_cache(0, ThreadType::Foreground).insert(
+            FileId::new(),
+            0,
+            Arc::new(TestCacheEntry(1024)),
+        );
+
+        assert_eq!(runtime.cache_occupancy(), (1024, 8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn global_sieve_cache_occupancy_is_not_double_counted() {
+        let path = tempfile::tempdir().unwrap();
+        let storage = CircuitStorageConfig::for_config(
+            StorageConfig {
+                path: path.path().to_string_lossy().into_owned(),
+                cache: StorageCacheConfig::default(),
+            },
+            StorageOptions {
+                cache_mib: Some(8),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        let runtime = Runtime(Arc::new(
+            RuntimeInner::new(
+                CircuitConfig::with_workers(2)
+                    .with_storage(storage)
+                    .with_buffer_cache_allocation_strategy(BufferCacheAllocationStrategy::Global),
+            )
+            .unwrap(),
+        ));
+
+        runtime.get_buffer_cache(1, ThreadType::Background).insert(
+            FileId::new(),
+            0,
+            Arc::new(TestCacheEntry(1024)),
+        );
+
+        assert_eq!(runtime.cache_occupancy(), (1024, 8 * 1024 * 1024));
     }
 
     fn test_runtime<S>()

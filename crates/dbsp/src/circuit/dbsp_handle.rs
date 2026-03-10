@@ -9,6 +9,7 @@ use crate::operator::dynamic::balance::{
     MIN_ABSOLUTE_IMPROVEMENT_THRESHOLD, MIN_RELATIVE_IMPROVEMENT_THRESHOLD, PartitioningPolicy,
 };
 use crate::storage::backend::StorageError;
+use crate::storage::buffer_cache::BufferCacheStrategy;
 use crate::storage::file::BLOOM_FILTER_FALSE_POSITIVE_RATE;
 use crate::trace::MergerType;
 use crate::{
@@ -281,6 +282,24 @@ pub struct CircuitConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DevTweaks {
+    /// Buffer-cache implementation to use for storage reads.
+    ///
+    /// The default is `sieve`.
+    pub buffer_cache_strategy: BufferCacheStrategy,
+
+    /// Override the number of buckets/shards used by the SIEVE buffer cache.
+    ///
+    /// This only applies when `buffer_cache_strategy = "sieve"`. Values are
+    /// rounded up to the next power of two because the current implementation
+    /// shards by `hash(key) & (n - 1)`.
+    pub buffer_max_buckets: Option<usize>,
+
+    /// How SIEVE buffer caches are assigned to foreground/background workers.
+    ///
+    /// This only applies when `buffer_cache_strategy = "sieve"`. The default
+    /// is a separate cache per thread.
+    pub buffer_cache_allocation_strategy: BufferCacheAllocationStrategy,
+
     /// Whether to asynchronously fetch keys needed for the join operator from
     /// storage.  Asynchronous fetching should be faster for high-latency
     /// storage, such as object storage, but it could use excessive amounts of
@@ -394,9 +413,27 @@ pub struct DevTweaks {
     pub bloom_false_positive_rate: f64,
 }
 
+/// Controls whether SIEVE caches are shared across the runtime or kept separate.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BufferCacheAllocationStrategy {
+    /// Create a separate SIEVE cache for each foreground/background thread.
+    #[default]
+    PerThread,
+
+    /// Share a single SIEVE cache across a foreground/background worker pair.
+    SharedPerWorkerPair,
+
+    /// Share a single SIEVE cache across all foreground/background threads.
+    Global,
+}
+
 impl Default for DevTweaks {
     fn default() -> Self {
         Self {
+            buffer_cache_strategy: BufferCacheStrategy::default(),
+            buffer_max_buckets: None,
+            buffer_cache_allocation_strategy: BufferCacheAllocationStrategy::default(),
             fetch_join: false,
             fetch_distinct: false,
             merger: MergerType::default(),
@@ -529,6 +566,24 @@ impl CircuitConfig {
 
     pub fn with_splitter_chunk_size_records(mut self, records: u64) -> Self {
         self.dev_tweaks.splitter_chunk_size_records = records;
+        self
+    }
+
+    pub fn with_buffer_cache_strategy(mut self, strategy: BufferCacheStrategy) -> Self {
+        self.dev_tweaks.buffer_cache_strategy = strategy;
+        self
+    }
+
+    pub fn with_buffer_max_buckets(mut self, max_buckets: Option<usize>) -> Self {
+        self.dev_tweaks.buffer_max_buckets = max_buckets;
+        self
+    }
+
+    pub fn with_buffer_cache_allocation_strategy(
+        mut self,
+        strategy: BufferCacheAllocationStrategy,
+    ) -> Self {
+        self.dev_tweaks.buffer_cache_allocation_strategy = strategy;
         self
     }
 

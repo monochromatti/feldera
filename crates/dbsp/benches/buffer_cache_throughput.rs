@@ -176,7 +176,7 @@ fn run_lru_mt(
     capacity_bytes: usize,
     max_duration: Option<Duration>,
 ) -> RunStats {
-    let cache = Arc::new(BufferCache::new(capacity_bytes));
+    let cache = Arc::new(BufferCache::new_lru(capacity_bytes));
     let file = Arc::new(BenchFile::new());
 
     for p in prefill {

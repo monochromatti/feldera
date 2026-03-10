@@ -1,7 +1,7 @@
-//! A buffer-cache based on LRU eviction.
+//! Buffer-cache implementations used by DBSP storage.
 //!
-//! This is a layer over a storage backend that adds a cache of a
-//! client-provided function of the blocks.
+//! `BufferCache` keeps the existing mutex-protected LRU implementation around
+//! and can also wrap the sharded SIEVE cache from `feldera-buffer-cache`.
 use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, AddAssign};
@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::{collections::BTreeMap, ops::Range};
 
 use enum_map::{Enum, EnumMap};
+use feldera_buffer_cache::SieveCache;
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
 
@@ -29,7 +30,7 @@ use crate::storage::backend::{BlockLocation, FileId, FileReader};
 ///
 /// It's important that the sort order is by `fd` first and `offset` second, so
 /// that [`CacheKey::fd_range`] can work.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CacheKey {
     /// File being cached.
     file_id: FileId,
@@ -51,6 +52,18 @@ impl CacheKey {
             offset: 0,
         }
     }
+}
+
+/// Selects which eviction strategy backs [`BufferCache`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BufferCacheStrategy {
+    /// Use the sharded SIEVE cache from `feldera-buffer-cache`.
+    #[default]
+    Sieve,
+
+    /// Use DBSP's existing mutex-protected LRU implementation.
+    Lru,
 }
 
 /// A value in the block cache.
@@ -185,26 +198,67 @@ impl CacheInner {
 
 /// A cache on top of a storage [backend](crate::storage::backend).
 pub struct BufferCache {
-    inner: Mutex<CacheInner>,
+    inner: BufferCacheInner,
+}
+
+enum BufferCacheInner {
+    Lru(Mutex<CacheInner>),
+    Sieve(SieveCache<CacheKey, Arc<dyn CacheEntry>>),
 }
 
 impl Debug for BufferCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferCache").finish()
+        f.debug_struct("BufferCache")
+            .field("strategy", &self.strategy())
+            .finish()
     }
 }
 
 impl BufferCache {
-    /// Creates a new cache on top of `backend`.
+    /// Creates a new cache using the default [`BufferCacheStrategy`].
     ///
-    /// It's best to use a single `StorageCache` for all uses of a given
-    /// `backend`, because otherwise the cache will end up with duplicates.
-    ///
-    /// `max_cost` limits the size of the cache. It is denominated in terms of
-    /// [CacheEntry::cost].
+    /// `max_cost` limits the size of the cache in terms of [CacheEntry::cost].
     pub fn new(max_cost: usize) -> Self {
-        Self {
-            inner: Mutex::new(CacheInner::new(max_cost)),
+        Self::new_with_strategy(max_cost, BufferCacheStrategy::default(), None)
+    }
+
+    /// Creates a new cache with an explicit strategy.
+    ///
+    /// `max_buckets` only applies to [`BufferCacheStrategy::Sieve`]. The SIEVE
+    /// implementation requires a power-of-two shard count, so values are rounded
+    /// up to the next power of two.
+    pub fn new_with_strategy(
+        max_cost: usize,
+        strategy: BufferCacheStrategy,
+        max_buckets: Option<usize>,
+    ) -> Self {
+        let inner = match strategy {
+            BufferCacheStrategy::Lru => {
+                BufferCacheInner::Lru(Mutex::new(CacheInner::new(max_cost)))
+            }
+            BufferCacheStrategy::Sieve => {
+                let shards = normalize_sieve_shards(max_buckets);
+                BufferCacheInner::Sieve(SieveCache::with_shards(max_cost, shards))
+            }
+        };
+        Self { inner }
+    }
+
+    /// Creates a new cache backed by DBSP's LRU implementation.
+    pub fn new_lru(max_cost: usize) -> Self {
+        Self::new_with_strategy(max_cost, BufferCacheStrategy::Lru, None)
+    }
+
+    /// Creates a new cache backed by the sharded SIEVE implementation.
+    pub fn new_sieve(max_cost: usize, max_buckets: Option<usize>) -> Self {
+        Self::new_with_strategy(max_cost, BufferCacheStrategy::Sieve, max_buckets)
+    }
+
+    /// Returns the strategy backing this cache.
+    pub fn strategy(&self) -> BufferCacheStrategy {
+        match &self.inner {
+            BufferCacheInner::Lru(_) => BufferCacheStrategy::Lru,
+            BufferCacheInner::Sieve(_) => BufferCacheStrategy::Sieve,
         }
     }
 
@@ -213,30 +267,57 @@ impl BufferCache {
         file: &dyn FileReader,
         location: BlockLocation,
     ) -> Option<Arc<dyn CacheEntry>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(CacheKey::new(file.file_id(), location.offset))
-            .clone()
+        let key = CacheKey::new(file.file_id(), location.offset);
+        match &self.inner {
+            BufferCacheInner::Lru(inner) => inner.lock().unwrap().get(key),
+            BufferCacheInner::Sieve(inner) => {
+                inner.get(&key).map(|entry| Arc::clone(entry.as_ref()))
+            }
+        }
     }
 
     pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(CacheKey::new(file_id, offset), aux);
+        let key = CacheKey::new(file_id, offset);
+        match &self.inner {
+            BufferCacheInner::Lru(inner) => inner.lock().unwrap().insert(key, aux),
+            BufferCacheInner::Sieve(inner) => {
+                let cost = aux.cost();
+                let _ = inner.insert(key, aux, cost);
+            }
+        }
     }
 
     pub fn evict(&self, file: &dyn FileReader) {
-        self.inner.lock().unwrap().delete_file(file.file_id());
+        match &self.inner {
+            BufferCacheInner::Lru(inner) => inner.lock().unwrap().delete_file(file.file_id()),
+            BufferCacheInner::Sieve(inner) => {
+                inner.remove_if(|key| key.file_id == file.file_id());
+            }
+        }
     }
 
     /// Returns `(cur_cost, max_cost)`, reporting the amount of the cache that
     /// is currently used and the maximum value, both denominated in terms of
     /// [CacheEntry::cost] for `CacheEntry`.
     pub fn occupancy(&self) -> (usize, usize) {
-        let inner = self.inner.lock().unwrap();
-        (inner.cur_cost, inner.max_cost)
+        match &self.inner {
+            BufferCacheInner::Lru(inner) => {
+                let inner = inner.lock().unwrap();
+                (inner.cur_cost, inner.max_cost)
+            }
+            BufferCacheInner::Sieve(inner) => (inner.total_charge(), inner.total_capacity()),
+        }
+    }
+}
+
+fn normalize_sieve_shards(max_buckets: Option<usize>) -> usize {
+    match max_buckets {
+        None => SieveCache::<CacheKey, Arc<dyn CacheEntry>>::DEFAULT_SHARDS,
+        Some(0) => SieveCache::<CacheKey, Arc<dyn CacheEntry>>::DEFAULT_SHARDS,
+        Some(buckets) if buckets.is_power_of_two() => buckets,
+        Some(buckets) => buckets
+            .checked_next_power_of_two()
+            .unwrap_or(SieveCache::<CacheKey, Arc<dyn CacheEntry>>::DEFAULT_SHARDS),
     }
 }
 

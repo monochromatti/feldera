@@ -1,11 +1,11 @@
 //! Buffer cache that can be used to cache reads.
 
-/// A buffer-cache based on LRU eviction.
+/// Buffer-cache implementations and cache statistics.
 mod cache;
 
 pub use feldera_storage::fbuf::{FBuf, FBufSerializer, LimitExceeded};
 
 pub use cache::{
-    AtomicCacheCounts, AtomicCacheStats, BufferCache, CacheAccess, CacheCounts, CacheEntry,
-    CacheStats,
+    AtomicCacheCounts, AtomicCacheStats, BufferCache, BufferCacheStrategy, CacheAccess,
+    CacheCounts, CacheEntry, CacheStats,
 };
