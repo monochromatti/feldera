@@ -172,9 +172,6 @@ mod thread_type {
         /// Circuit thread.
         Foreground,
 
-        /// Merger thread.
-        Background,
-
         /// Merger tokio thread.
         MergerTokio,
     }
@@ -196,7 +193,6 @@ mod thread_type {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 ThreadType::Foreground => write!(f, "foreground"),
-                ThreadType::Background => write!(f, "background"),
                 ThreadType::MergerTokio => write!(f, "merger tokio"),
             }
         }
@@ -396,7 +392,6 @@ fn map_pin_cpus(layout: &Layout, pin_cpus: &[usize]) -> Vec<EnumMap<ThreadType, 
         .map(|i| {
             enum_map! {
                 ThreadType::Foreground => fg_cpus[i],
-                ThreadType::Background => bg_cpus[i],
                 ThreadType::MergerTokio => todo!(),
             }
         })
@@ -475,7 +470,7 @@ impl RuntimeInner {
                     let cache = global_sieve_cache.as_ref().unwrap().clone();
                     enum_map! {
                         ThreadType::Foreground => cache.clone(),
-                        ThreadType::Background => cache.clone(),
+                        ThreadType::MergerTokio => cache.clone(),
                     }
                 }
                 BufferCacheStrategy::Sieve
@@ -486,16 +481,16 @@ impl RuntimeInner {
                         Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets));
                     enum_map! {
                         ThreadType::Foreground => cache.clone(),
-                        ThreadType::Background => cache.clone(),
+                        ThreadType::MergerTokio => cache.clone(),
                     }
                 }
                 BufferCacheStrategy::Sieve => enum_map! {
                     ThreadType::Foreground => Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets)),
-                    ThreadType::Background => Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets)),
+                    ThreadType::MergerTokio => Arc::new(BufferCache::new_sieve(cache_size_bytes, buffer_max_buckets)),
                 },
                 BufferCacheStrategy::Lru => enum_map! {
                     ThreadType::Foreground => Arc::new(BufferCache::new_lru(cache_size_bytes)),
-                    ThreadType::Background => Arc::new(BufferCache::new_lru(cache_size_bytes)),
+                    ThreadType::MergerTokio => Arc::new(BufferCache::new_lru(cache_size_bytes)),
                 },
             })
             .collect();
