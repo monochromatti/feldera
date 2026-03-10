@@ -38,11 +38,11 @@ pub use circuit_builder::{
     NestedCircuit, NodeId, OwnershipPreference, RootCircuit, Scope, Stream, WithClock,
 };
 pub use dbsp_handle::{
-    BufferCacheAllocationStrategy, CheckpointCommitter, CircuitConfig, DBSPHandle, DevTweaks, Host,
-    Layout, LayoutError, Mode, StorageCacheConfig, StorageConfig, StorageOptions,
-    adaptive_joins_enabled, balancer_balance_tax, balancer_key_distribution_refresh_threshold,
-    balancer_min_absolute_improvement_threshold, balancer_min_relative_improvement_threshold,
-    merger_worker_threads, splitter_output_chunk_size,
+    BufferCacheAllocationStrategy, CheckpointCommitter, CircuitConfig, CircuitStorageConfig,
+    DBSPHandle, DevTweaks, Host, Layout, LayoutError, Mode, StorageCacheConfig, StorageConfig,
+    StorageOptions, adaptive_joins_enabled, balancer_balance_tax,
+    balancer_key_distribution_refresh_threshold, balancer_min_absolute_improvement_threshold,
+    balancer_min_relative_improvement_threshold, merger_worker_threads, splitter_output_chunk_size,
 };
 pub use runtime::{
     Error as RuntimeError, LocalStore, LocalStoreMarker, Runtime, RuntimeHandle, WeakRuntime,

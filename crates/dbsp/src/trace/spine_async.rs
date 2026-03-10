@@ -20,7 +20,7 @@ use crate::{
             SPINE_STORAGE_SIZE_BYTES,
         },
         metrics::COMPACTION_STALL_TIME_NANOSECONDS,
-        runtime::{TOKIO_MERGER, TOKIO_WORKER_INDEX},
+        runtime::{TOKIO_BUFFER_CACHE, TOKIO_MERGER, TOKIO_WORKER_INDEX},
     },
     dynamic::{DynVec, Factory, Weight},
     storage::buffer_cache::CacheStats,
@@ -68,7 +68,7 @@ mod index_set;
 mod list_merger;
 mod push_merger;
 mod snapshot;
-use self::thread::{BackgroundThread, WorkerStatus};
+use self::thread::WorkerStatus;
 pub use snapshot::{BatchReaderWithSnapshot, SpineSnapshot, WithSnapshot};
 
 use super::{BatchLocation, cursor::CursorFactory};
@@ -432,41 +432,47 @@ where
             let worker_index = Runtime::worker_index();
 
             TOKIO_MERGER.spawn(async move {
-                //println!("{worker_index}: starting merger worker thread level: {level}");
+                //println!("{worker_index}: starting merger worker task for level: {level}");
                 TOKIO_WORKER_INDEX
                     .scope(worker_index, async move {
-                        let state = Arc::clone(&state);
-                        let idle = Arc::clone(&idle);
-                        let no_backpressure = Arc::clone(&no_backpressure);
-                        let mut merger = None;
-                        let merger_type = Runtime::with_dev_tweaks(|tweaks| tweaks.merger);
-                        let notify = state.lock().unwrap().slots[level].notify.clone();
-                        loop {
-                            let status = Self::run(
-                                &worker_state,
-                                level,
-                                &mut merger,
-                                merger_type,
-                                &state,
-                                &idle,
-                                &no_backpressure,
-                            );
-                            match status {
-                                WorkerStatus::Busy => {
-                                    //println!("{worker_index}: merger level {level} is yielding");
-                                    yield_now().await
+                        TOKIO_BUFFER_CACHE
+                            .scope(Runtime::buffer_cache(), async move {
+                                let state = Arc::clone(&state);
+                                let idle = Arc::clone(&idle);
+                                let no_backpressure = Arc::clone(&no_backpressure);
+                                let mut merger = None;
+                                let merger_type = Runtime::with_dev_tweaks(|tweaks| tweaks.merger);
+                                let notify = state.lock().unwrap().slots[level].notify.clone();
+                                loop {
+                                    let status = Self::run(
+                                        &worker_state,
+                                        level,
+                                        &mut merger,
+                                        merger_type,
+                                        &state,
+                                        &idle,
+                                        &no_backpressure,
+                                    );
+                                    match status {
+                                        WorkerStatus::Busy => {
+                                            //println!("{worker_index}: merger level {level} is yielding");
+                                            yield_now().await
+                                        }
+                                        WorkerStatus::Idle => {
+                                            //println!("{worker_index}: merger level {level} is idle");
+                                            notify.notified().await;
+                                            //println!("{worker_index}: merger level {level} is awake");
+                                        }
+                                        WorkerStatus::Done => {
+                                            // println!(
+                                            //     "{worker_index}: merger level {level} is done"
+                                            // );
+                                            break;
+                                        }
+                                    }
                                 }
-                                WorkerStatus::Idle => {
-                                    //println!("{worker_index}: merger level {level} is idle");
-                                    notify.notified().await;
-                                    //println!("{worker_index}: merger level {level} is awake");
-                                }
-                                WorkerStatus::Done => {
-                                    //println!("{worker_index}: merger level {level} is done");
-                                    break;
-                                }
-                            }
-                        }
+                            })
+                            .await;
                     })
                     .await;
             });
@@ -494,7 +500,7 @@ where
         debug_assert!(!batch.is_empty());
         let mut state = self.state.lock().unwrap();
         state.add_batch(batch);
-        BackgroundThread::wake();
+        //BackgroundThread::wake();
         if state.should_apply_backpressure() {
             let start = Instant::now();
             let mut state = self.no_backpressure.wait(state).unwrap();
@@ -507,7 +513,7 @@ where
     /// Adds `batches` to the shared merging state and wakes up the merger.
     fn add_batches(&self, batches: impl IntoIterator<Item = Arc<B>>) {
         self.state.lock().unwrap().add_batches(batches);
-        BackgroundThread::wake();
+        //BackgroundThread::wake();
     }
 
     /// Gets the complete set of batches to include in the spine.
@@ -827,7 +833,12 @@ where
 {
     fn drop(&mut self) {
         self.state.lock().unwrap().request_exit = true;
-        BackgroundThread::wake();
+
+        for level in 0..MAX_LEVELS {
+            self.state.lock().unwrap().slots[level].notify.notify_one();
+        }
+
+        //BackgroundThread::wake();
     }
 }
 

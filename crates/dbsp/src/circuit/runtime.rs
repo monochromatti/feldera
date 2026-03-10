@@ -75,7 +75,7 @@ pub static TOKIO_MERGER: Lazy<TokioRuntime> = Lazy::new(|| {
             format!("merger-tokio-{}", id)
         })
         .on_thread_start(move || {
-            //ThreadType::set_current(ThreadType::Background);
+            ThreadType::set_current(ThreadType::MergerTokio);
             RUNTIME.with(|rt| *rt.borrow_mut() = Some(runtime.clone()));
         })
         .thread_stack_size(6 * 1024 * 1024)
@@ -86,6 +86,10 @@ pub static TOKIO_MERGER: Lazy<TokioRuntime> = Lazy::new(|| {
 
 tokio::task_local! {
     pub static TOKIO_WORKER_INDEX: usize;
+}
+
+tokio::task_local! {
+    pub static TOKIO_BUFFER_CACHE: Arc<BufferCache>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -718,10 +722,6 @@ impl Runtime {
         thread_local! {
             static BUFFER_CACHE: RefCell<Option<Arc<BufferCache>>> = const { RefCell::new(None) };
         }
-        tokio::task_local! {
-            static TOKIO_BUFFER_CACHE: RefCell<Arc<BufferCache>>;
-        }
-
         // No `Runtime` means there's only a single worker, so use a single
         // global cache.
         // This cache is also used by all auxiliary threads in the runtime.
@@ -733,9 +733,13 @@ impl Runtime {
             LazyLock::new(|| Arc::new(BufferCache::new(1024 * 1024 * 256)));
 
         if ThreadType::current() == Some(ThreadType::MergerTokio) {
-            if let Ok(buffer_cache) = TOKIO_BUFFER_CACHE.try_with(|bc| bc.borrow().clone()) {
+            if let Ok(buffer_cache) = TOKIO_BUFFER_CACHE.try_with(|bc| bc.clone()) {
                 return buffer_cache;
             }
+            // println!(
+            //     "tokio buffer cache not set for tokio worker {}",
+            //     TOKIO_WORKER_INDEX.get()
+            // );
         } else {
             if let Some(buffer_cache) = BUFFER_CACHE.with(|bc| bc.borrow().clone()) {
                 return buffer_cache;
@@ -753,12 +757,23 @@ impl Runtime {
                 Some(ThreadType::MergerTokio) => {
                     let buffer_cache =
                         rt.get_buffer_cache(TOKIO_WORKER_INDEX.get(), ThreadType::MergerTokio);
-                    TOKIO_BUFFER_CACHE.with(|bc| *bc.borrow_mut() = buffer_cache.clone());
+                    // info!(
+                    //     "using buffer cache {:?} for tokio thread {}",
+                    //     Arc::as_ptr(&buffer_cache),
+                    //     TOKIO_WORKER_INDEX.get()
+                    // );
+
+                    // TOKIO_BUFFER_CACHE.with(|bc| *bc.borrow_mut() = buffer_cache.clone());
                     buffer_cache
                 }
                 Some(thread_type) => {
                     let buffer_cache =
                         rt.get_buffer_cache(Runtime::local_worker_offset(), thread_type);
+                    // info!(
+                    //     "using buffer cache {:?} for thread {}",
+                    //     Arc::as_ptr(&buffer_cache),
+                    //     Runtime::local_worker_offset()
+                    // );
                     BUFFER_CACHE.set(Some(buffer_cache.clone()));
                     buffer_cache
                 }
@@ -1067,41 +1082,41 @@ impl Runtime {
         self.inner().panicked.store(true, Ordering::Release);
     }
 
-    /// Spawn a new thread using `builder` and `f`. If the current thread is
-    /// associated with a runtime, then the new thread will also be associated
-    /// with the same runtime and worker index.
-    pub(crate) fn spawn_background_thread<F>(builder: Builder, f: F) -> (Thread, Unparker)
-    where
-        F: FnOnce(Parker) + Send + 'static,
-    {
-        let runtime = Self::runtime();
-        let worker_index = Self::worker_index();
-        let parker = Parker::new();
-        let unparker = parker.unparker().clone();
-        let join_handle = builder
-            .spawn(move || {
-                WORKER_INDEX.set(worker_index);
-                ThreadType::set_current(ThreadType::Background);
-                if let Some(runtime) = runtime {
-                    runtime.inner().pin_cpu();
-                    RUNTIME.with(|rt| *rt.borrow_mut() = Some(runtime));
-                }
-                f(parker)
-            })
-            .unwrap_or_else(|error| {
-                panic!("failed to spawn background worker thread {worker_index}: {error}");
-            });
-        let thread = join_handle.thread().clone();
-        if let Some(runtime) = Self::runtime() {
-            runtime
-                .inner()
-                .background_threads
-                .lock()
-                .unwrap()
-                .push(join_handle);
-        }
-        (thread, unparker)
-    }
+    // /// Spawn a new thread using `builder` and `f`. If the current thread is
+    // /// associated with a runtime, then the new thread will also be associated
+    // /// with the same runtime and worker index.
+    // pub(crate) fn spawn_background_thread<F>(builder: Builder, f: F) -> (Thread, Unparker)
+    // where
+    //     F: FnOnce(Parker) + Send + 'static,
+    // {
+    //     let runtime = Self::runtime();
+    //     let worker_index = Self::worker_index();
+    //     let parker = Parker::new();
+    //     let unparker = parker.unparker().clone();
+    //     let join_handle = builder
+    //         .spawn(move || {
+    //             WORKER_INDEX.set(worker_index);
+    //             ThreadType::set_current(ThreadType::Background);
+    //             if let Some(runtime) = runtime {
+    //                 runtime.inner().pin_cpu();
+    //                 RUNTIME.with(|rt| *rt.borrow_mut() = Some(runtime));
+    //             }
+    //             f(parker)
+    //         })
+    //         .unwrap_or_else(|error| {
+    //             panic!("failed to spawn background worker thread {worker_index}: {error}");
+    //         });
+    //     let thread = join_handle.thread().clone();
+    //     if let Some(runtime) = Self::runtime() {
+    //         runtime
+    //             .inner()
+    //             .background_threads
+    //             .lock()
+    //             .unwrap()
+    //             .push(join_handle);
+    //     }
+    //     (thread, unparker)
+    // }
 }
 
 /// A synchronization primitive that allows multiple threads within a runtime to agree
@@ -1394,7 +1409,7 @@ impl RuntimeHandle {
         let mut result = Vec::new();
 
         for worker in 0..self.workers.len() {
-            for thread_type in [ThreadType::Foreground, ThreadType::Background] {
+            for thread_type in [ThreadType::Foreground] {
                 if let Some(panic_info) = self.worker_panic_info(worker, thread_type) {
                     result.push((worker, thread_type, panic_info))
                 }
@@ -1479,11 +1494,11 @@ mod tests {
         let inner = RuntimeInner::new(CircuitConfig::with_workers(2)).unwrap();
         assert!(!Arc::ptr_eq(
             &inner.buffer_caches[0][ThreadType::Foreground],
-            &inner.buffer_caches[0][ThreadType::Background],
+            &inner.buffer_caches[0][ThreadType::MergerTokio],
         ));
         assert!(!Arc::ptr_eq(
             &inner.buffer_caches[1][ThreadType::Foreground],
-            &inner.buffer_caches[1][ThreadType::Background],
+            &inner.buffer_caches[1][ThreadType::MergerTokio],
         ));
     }
 
@@ -1495,11 +1510,11 @@ mod tests {
         let inner = RuntimeInner::new(config).unwrap();
         assert!(Arc::ptr_eq(
             &inner.buffer_caches[0][ThreadType::Foreground],
-            &inner.buffer_caches[0][ThreadType::Background],
+            &inner.buffer_caches[0][ThreadType::MergerTokio],
         ));
         assert!(Arc::ptr_eq(
             &inner.buffer_caches[1][ThreadType::Foreground],
-            &inner.buffer_caches[1][ThreadType::Background],
+            &inner.buffer_caches[1][ThreadType::MergerTokio],
         ));
     }
 
@@ -1511,7 +1526,7 @@ mod tests {
         let global = inner.buffer_caches[0][ThreadType::Foreground].clone();
         assert!(Arc::ptr_eq(
             &global,
-            &inner.buffer_caches[0][ThreadType::Background],
+            &inner.buffer_caches[0][ThreadType::MergerTokio],
         ));
         assert!(Arc::ptr_eq(
             &global,
@@ -1519,7 +1534,7 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(
             &global,
-            &inner.buffer_caches[1][ThreadType::Background],
+            &inner.buffer_caches[1][ThreadType::MergerTokio],
         ));
     }
 
@@ -1533,11 +1548,11 @@ mod tests {
         let inner = RuntimeInner::new(config).unwrap();
         assert!(!Arc::ptr_eq(
             &inner.buffer_caches[0][ThreadType::Foreground],
-            &inner.buffer_caches[0][ThreadType::Background],
+            &inner.buffer_caches[0][ThreadType::MergerTokio],
         ));
         assert!(!Arc::ptr_eq(
             &inner.buffer_caches[1][ThreadType::Foreground],
-            &inner.buffer_caches[1][ThreadType::Background],
+            &inner.buffer_caches[1][ThreadType::MergerTokio],
         ));
     }
 
@@ -1598,7 +1613,7 @@ mod tests {
             .unwrap(),
         ));
 
-        runtime.get_buffer_cache(1, ThreadType::Background).insert(
+        runtime.get_buffer_cache(1, ThreadType::MergerTokio).insert(
             FileId::new(),
             0,
             Arc::new(TestCacheEntry(1024)),
