@@ -723,6 +723,10 @@ impl Runtime {
         thread_local! {
             static BUFFER_CACHE: RefCell<Option<Arc<BufferCache>>> = const { RefCell::new(None) };
         }
+        tokio::task_local! {
+            static TOKIO_BUFFER_CACHE: RefCell<Arc<BufferCache>>;
+        }
+
         // No `Runtime` means there's only a single worker, so use a single
         // global cache.
         // This cache is also used by all auxiliary threads in the runtime.
@@ -733,8 +737,14 @@ impl Runtime {
         static NO_RUNTIME_CACHE: LazyLock<Arc<BufferCache>> =
             LazyLock::new(|| Arc::new(BufferCache::new(1024 * 1024 * 256)));
 
-        if let Some(buffer_cache) = BUFFER_CACHE.with(|bc| bc.borrow().clone()) {
-            return buffer_cache;
+        if ThreadType::current() == Some(ThreadType::MergerTokio) {
+            if let Ok(buffer_cache) = TOKIO_BUFFER_CACHE.try_with(|bc| bc.borrow().clone()) {
+                return buffer_cache;
+            }
+        } else {
+            if let Some(buffer_cache) = BUFFER_CACHE.with(|bc| bc.borrow().clone()) {
+                return buffer_cache;
+            }
         }
 
         // Slow path for initializing the thread-local.
@@ -748,8 +758,7 @@ impl Runtime {
                 Some(ThreadType::MergerTokio) => {
                     let buffer_cache =
                         rt.get_buffer_cache(TOKIO_WORKER_INDEX.get(), ThreadType::MergerTokio);
-                    // FIXME: ONLY WORKS WHEN THERE IS ONE GLOBAL CACHE
-                    BUFFER_CACHE.set(Some(buffer_cache.clone()));
+                    TOKIO_BUFFER_CACHE.with(|bc| *bc.borrow_mut() = buffer_cache.clone());
                     buffer_cache
                 }
                 Some(thread_type) => {
