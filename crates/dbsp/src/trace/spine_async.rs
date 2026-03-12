@@ -333,7 +333,7 @@ where
         self.add_batches([new_batch]);
     }
 
-    /// Returns a copy of the data that the caller can use to construct a
+    /// Returns a copy of the data tyeahhat the caller can use to construct a
     /// metadata report.
     ///
     /// This is better than constructing the report here directly, because part
@@ -1699,8 +1699,8 @@ where
     fn size_to_level(len: usize) -> usize {
         debug_assert_eq!(MAX_LEVELS, 9);
         match len {
-            0..=9999 => 0,
-            10_000..=99_999 => 1,
+            0..=14999 => 0,
+            15_000..=99_999 => 1,
             100_000..=999_999 => 2,
             1_000_000..=9_999_999 => 3,
             10_000_000..=99_999_999 => 4,
