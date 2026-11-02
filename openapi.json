@@ -10684,6 +10684,137 @@
           }
         ]
       },
+      "DuckLakeCatalogConfig": {
+        "type": "object",
+        "description": "Where a DuckLake catalog lives and how to attach it.\n\nShared by both halves of the connector and flattened into each of their\nconfigs, so a writer config looks like this:\n\n```json\n{\n\"catalog\": \"ducklake:/var/lib/feldera/meta.ducklake\",\n\"schema\": \"main\",\n\"output_group\": \"orders\",\n\"generation\": \"v1\",\n\"tables\": { \"orders_out\": { \"table\": \"orders\" } }\n}\n```",
+        "required": [
+          "catalog"
+        ],
+        "properties": {
+          "alias": {
+            "type": "string",
+            "description": "Name the catalog is attached under.\n\nDefault: `dl`."
+          },
+          "catalog": {
+            "type": "string",
+            "description": "ATTACH target for the DuckLake catalog.\n\nEither a metadata file (`ducklake:/path/to/meta.ducklake`) or a\nPostgreSQL-backed catalog (`ducklake:postgres:dbname=ducklake host=...`).\nThe form decides how concurrent access fails, and the difference matters:\na file-backed catalog refuses a second process the `ATTACH` itself, while\na PostgreSQL-backed one admits two writers and reports the conflict at\n`COMMIT`. The connector is correct under both, but only the latter is a\nconfiguration where two processes can actually race."
+          },
+          "data_path": {
+            "type": "string",
+            "description": "Directory that DuckLake writes data files to, overriding the catalog's\nown setting.\n\nNeeded when the catalog was created with a data path that is not valid\nfrom the pipeline host. Unset uses the catalog's.",
+            "nullable": true
+          },
+          "extension_directory": {
+            "type": "string",
+            "description": "Directory that holds the DuckLake extension binary.\n\nSet it to the directory holding a vendored `ducklake.duckdb_extension`;\nunset lets DuckDB download the extension on first use, which fails on a\nhost without egress. Deployment should vendor the file: extension\nbinaries are per-platform and version-locked to the DuckDB library, so\nthe two are pinned together.",
+            "nullable": true
+          },
+          "inlining_row_limit": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows per data file stored inline in the catalog rather than written to a\nseparate file.\n\nUnset uses DuckLake's default. Lowering it makes the catalog the\nbottleneck sooner; raising it makes every commit carry more payload.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string",
+            "description": "DuckLake schema holding the connector's tables.\n\nDefault: `main`."
+          }
+        }
+      },
+      "DuckLakeReaderConfig": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DuckLakeCatalogConfig"
+          },
+          {
+            "type": "object",
+            "required": [
+              "table"
+            ],
+            "properties": {
+              "poll_interval": {
+                "type": "string",
+                "description": "How often to ask the catalog for new changes, for example `500ms`.\n\nUnset selects [`DEFAULT_POLL_INTERVAL`]. The interval is the floor on\nend-to-end latency, not a rate limit, since a poll that finds nothing\ncosts one query.",
+                "nullable": true
+              },
+              "table": {
+                "type": "string",
+                "description": "DuckLake table to read.\n\nRead as a change stream: the first read is a bootstrap snapshot of the\ntable's current contents, and every later read asks for the changes since\nthe last one. Both are the same table function over a snapshot range, so\nthe connector has no notion of a \"full\" versus an \"incremental\" query to\nget wrong."
+              }
+            }
+          }
+        ],
+        "description": "DuckLake input connector configuration."
+      },
+      "DuckLakeSinkConfig": {
+        "type": "object",
+        "description": "One Feldera output view and the DuckLake table its rows land in.",
+        "required": [
+          "table"
+        ],
+        "properties": {
+          "key_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Columns that identify a row, for keyed replacement.\n\nA step carries signed multiplicities, not a keyed diff, so a row that the\nview removed and re-added is a `-1` and a `+1` of the same row. With key\ncolumns the connector replaces by key (`DELETE` where the key matches,\nthen `INSERT`); without them it deletes exactly one matching row and\ninserts one, which preserves a bag. Unset keeps the bag semantics, which\nis right for every table that is not known to have a key."
+          },
+          "table": {
+            "type": "string",
+            "description": "DuckLake table to write the view's rows to.\n\nCreated by the catalog owner, not by the connector: the connector's job is\nto keep one output group's frontier and its rows in step, and a table it\ninvented on the fly would have no such history."
+          }
+        }
+      },
+      "DuckLakeWriterConfig": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DuckLakeCatalogConfig"
+          },
+          {
+            "type": "object",
+            "required": [
+              "output_group",
+              "generation",
+              "tables"
+            ],
+            "properties": {
+              "epoch": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Ownership epoch, used to take over a group that a previous owner pinned.\n\nMust strictly increase across takeovers; the connector refuses to write at\nan epoch that is not greater than the one in the guard row. Unset keeps\nthe row's epoch and fails if this generation did not pin it.",
+                "nullable": true,
+                "minimum": 0
+              },
+              "generation": {
+                "type": "string",
+                "description": "Identity of this publication arrangement, e.g. a pipeline generation.\n\nPart of every batch identity, so a re-created pipeline that inherits the\ngroup's guard row must keep the generation it had, or take over\nexplicitly with a higher `epoch`. A changed generation under an unchanged\nepoch is refused rather than guessed at."
+              },
+              "guard_table": {
+                "type": "string",
+                "description": "Table holding this group's guard row.\n\nDefault: `connector_guard`."
+              },
+              "output_group": {
+                "type": "string",
+                "description": "Name of the output group this connector publishes.\n\nOne guard row per group, so the group name is what a second pipeline must\nnot reuse for a different set of tables: two publishers that share a group\nfence each other off instead of interleaving writes into the same rows."
+              },
+              "send_snapshot": {
+                "type": "boolean",
+                "description": "Whether to resynchronize from the engine's snapshot when the guard row is\nbehind the tables.\n\nDefault: `true`. Disabling it turns a catalog that is out of step into a\nstartup error instead of a rewrite, which is what a deployment that\nsuspects the two disagree wants."
+              },
+              "tables": {
+                "type": "object",
+                "description": "Feldera output view to DuckLake table mapping, for one step.\n\nOrdered by view name so that the assembly order — and therefore the SQL\nthe connector emits, and the digest it computes — is a property of the\nconfiguration rather than of a hash map's iteration order.",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/DuckLakeSinkConfig"
+                }
+              }
+            }
+          }
+        ],
+        "description": "DuckLake output connector configuration."
+      },
       "DynamicConfig": {
         "type": "object",
         "description": "The part of a pipeline's config that can change while the pipeline runs.",
@@ -16839,6 +16970,42 @@
                 "type": "string",
                 "enum": [
                   "delta_table_output"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "config"
+            ],
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/DuckLakeReaderConfig"
+              },
+              "name": {
+                "type": "string",
+                "enum": [
+                  "ducklake_input"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "config"
+            ],
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/DuckLakeWriterConfig"
+              },
+              "name": {
+                "type": "string",
+                "enum": [
+                  "ducklake_output"
                 ]
               }
             }

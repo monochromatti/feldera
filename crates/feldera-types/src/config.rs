@@ -15,6 +15,7 @@ use crate::transport::adhoc::AdHocInputConfig;
 use crate::transport::clock::{ClockConfig, ClockTimezoneOffset};
 use crate::transport::datagen::DatagenInputConfig;
 use crate::transport::delta_table::{DeltaTableReaderConfig, DeltaTableWriterConfig};
+use crate::transport::ducklake::{DuckLakeReaderConfig, DuckLakeWriterConfig};
 use crate::transport::dynamodb::DynamoDBWriterConfig;
 use crate::transport::file::{FileInputConfig, FileOutputConfig};
 use crate::transport::http::{HttpInputConfig, HttpOutputConfig};
@@ -3875,6 +3876,12 @@ pub enum TransportConfig {
     S3Input(S3InputConfig),
     DeltaTableInput(DeltaTableReaderConfig),
     DeltaTableOutput(DeltaTableWriterConfig),
+    // `rename_all = "snake_case"` would spell this `duck_lake_input`; DuckLake is
+    // one word, the way DynamoDB below is.
+    #[serde(rename = "ducklake_input")]
+    DuckLakeInput(DuckLakeReaderConfig),
+    #[serde(rename = "ducklake_output")]
+    DuckLakeOutput(DuckLakeWriterConfig),
     // Snake case would rename "DynamoDBOutput" to `dynamo_db_output`.
     // However, DynamoDB is a single word, so override the tag to `dynamodb_output`.
     #[serde(rename = "dynamodb_output")]
@@ -3920,13 +3927,20 @@ fn is_local_file_uri(location: &str) -> bool {
 }
 
 impl TransportConfig {
-    /// The local paths of a Delta Lake or Iceberg connector, as (property, value) pairs.
+    /// The local paths of a Delta Lake, DuckLake or Iceberg connector, as (property, value)
+    /// pairs.
     /// Before references are `resolved`, skips them. After, checks every value, because a
     /// resolved value can look like a reference.
     pub fn local_file_uris(&self, resolved: bool) -> Vec<(&'static str, &str)> {
         let locations = match self {
             TransportConfig::DeltaTableInput(config) => vec![("uri", Some(&*config.uri))],
             TransportConfig::DeltaTableOutput(config) => vec![("uri", Some(&*config.uri))],
+            TransportConfig::DuckLakeInput(config) => {
+                vec![("catalog", Some(&*config.catalog.catalog))]
+            }
+            TransportConfig::DuckLakeOutput(config) => {
+                vec![("catalog", Some(&*config.catalog.catalog))]
+            }
             TransportConfig::IcebergInput(config) => vec![
                 ("metadata_location", config.metadata_location.as_deref()),
                 (
@@ -3978,6 +3992,9 @@ impl TransportConfig {
                     Some(config.connection_config.request_timeout());
                 config.publish_timeout = Some(config.publish_timeout());
             }
+            TransportConfig::DuckLakeInput(config) => {
+                config.poll_interval = Some(config.poll_interval());
+            }
             _ => {}
         }
     }
@@ -3995,6 +4012,8 @@ impl TransportConfig {
             TransportConfig::S3Input(_) => "s3_input".to_string(),
             TransportConfig::DeltaTableInput(_) => "delta_table_input".to_string(),
             TransportConfig::DeltaTableOutput(_) => "delta_table_output".to_string(),
+            TransportConfig::DuckLakeInput(_) => "ducklake_input".to_string(),
+            TransportConfig::DuckLakeOutput(_) => "ducklake_output".to_string(),
             TransportConfig::DynamoDBOutput(_) => "dynamodb_output".to_string(),
             TransportConfig::IcebergInput(_) => "iceberg_input".to_string(),
             TransportConfig::PostgresInput(_) => "postgres_input".to_string(),

@@ -227,6 +227,22 @@ fn type_replacement() -> Vec<(&'static str, &'static str)> {
             "feldera_types::transport::nats::NatsOutputConfig",
         ),
         (
+            "DuckLakeCatalogConfig",
+            "feldera_types::transport::ducklake::DuckLakeCatalogConfig",
+        ),
+        (
+            "DuckLakeSinkConfig",
+            "feldera_types::transport::ducklake::DuckLakeSinkConfig",
+        ),
+        (
+            "DuckLakeWriterConfig",
+            "feldera_types::transport::ducklake::DuckLakeWriterConfig",
+        ),
+        (
+            "DuckLakeReaderConfig",
+            "feldera_types::transport::ducklake::DuckLakeReaderConfig",
+        ),
+        (
             "StartFromCheckpoint",
             "feldera_types::config::StartFromCheckpoint",
         ),

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "with-deltalake")]
 pub mod delta_table;
+pub(crate) mod ducklake;
 #[cfg(feature = "with-dynamodb")]
 pub(crate) mod dynamodb;
 pub(crate) mod postgres;
@@ -80,6 +81,16 @@ pub fn create_integrated_output_endpoint(
             controller,
             is_index,
         )?),
+        TransportConfig::DuckLakeOutput(config) => Box::new(ducklake::DuckLakeWriter::new(
+            endpoint_id,
+            endpoint_name,
+            config,
+            key_schema,
+            schema,
+            controller,
+            shutdown,
+            continue_previous_state,
+        )?),
         #[cfg(feature = "with-dynamodb")]
         TransportConfig::DynamoDBOutput(config) => Box::new(DynamoDBOutputEndpoint::new(
             endpoint_id,
@@ -129,45 +140,49 @@ pub fn create_integrated_input_endpoint(
     // another's reads (#7080). The memory pool and caches stay shared.
     let runtime_env = with_private_object_store_registry(&runtime_env)?;
 
-    let ep: Box<dyn IntegratedInputEndpoint> = match &config.transport {
-        #[cfg(feature = "with-deltalake")]
-        TransportConfig::DeltaTableInput(config) => {
-            Box::new(delta_table::DeltaTableInputEndpoint::new(
+    let ep: Box<dyn IntegratedInputEndpoint> =
+        match &config.transport {
+            #[cfg(feature = "with-deltalake")]
+            TransportConfig::DeltaTableInput(config) => {
+                Box::new(delta_table::DeltaTableInputEndpoint::new(
+                    endpoint_name,
+                    config,
+                    pipeline_config,
+                    runtime_env,
+                    consumer,
+                    distributed,
+                ))
+            }
+            #[cfg(feature = "with-iceberg")]
+            TransportConfig::IcebergInput(config) => {
+                Box::new(feldera_iceberg::IcebergInputEndpoint::new(
+                    endpoint_name,
+                    config,
+                    pipeline_config,
+                    runtime_env,
+                    consumer,
+                    distributed,
+                ))
+            }
+            TransportConfig::DuckLakeInput(config) => Box::new(
+                ducklake::DuckLakeInputEndpoint::new(endpoint_name, config, consumer),
+            ),
+            TransportConfig::PostgresInput(config) => {
+                Box::new(PostgresInputEndpoint::new(endpoint_name, config, consumer))
+            }
+            #[cfg(feature = "with-postgres-cdc")]
+            TransportConfig::PostgresCdcInput(config) => Box::new(PostgresCdcInputEndpoint::new(
                 endpoint_name,
                 config,
-                pipeline_config,
-                runtime_env,
                 consumer,
-                distributed,
-            ))
-        }
-        #[cfg(feature = "with-iceberg")]
-        TransportConfig::IcebergInput(config) => {
-            Box::new(feldera_iceberg::IcebergInputEndpoint::new(
-                endpoint_name,
-                config,
-                pipeline_config,
-                runtime_env,
-                consumer,
-                distributed,
-            ))
-        }
-        TransportConfig::PostgresInput(config) => {
-            Box::new(PostgresInputEndpoint::new(endpoint_name, config, consumer))
-        }
-        #[cfg(feature = "with-postgres-cdc")]
-        TransportConfig::PostgresCdcInput(config) => Box::new(PostgresCdcInputEndpoint::new(
-            endpoint_name,
-            config,
-            consumer,
-        )?),
-        transport => {
-            return Err(ControllerError::unknown_input_transport(
-                endpoint_name,
-                &transport.name(),
-            ));
-        }
-    };
+            )?),
+            transport => {
+                return Err(ControllerError::unknown_input_transport(
+                    endpoint_name,
+                    &transport.name(),
+                ));
+            }
+        };
 
     if config.format.is_some() {
         return Err(ControllerError::invalid_parser_configuration(
