@@ -73,7 +73,14 @@
 //! property of the catalog, not of this connector — PostgreSQL is how one runs a
 //! pipeline and a writer side by side.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result as AnyResult, bail};
 use feldera_adapterlib::{
@@ -93,9 +100,6 @@ use super::{
     catalog::{attach_statement, quote_ident, sql_literal},
     ffi::{Conn, Db, Library, Rows},
 };
-
-/// How long to wait before asking a quiet catalog for a new snapshot again.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How often to look for the controller's `Queue` while rows are buffered.  A
 /// step cannot start until the buffered rows are flushed, so this is short.
@@ -127,6 +131,25 @@ impl ReaderState {
 /// The reader handed to the controller: a channel to its worker thread.
 pub struct DuckLakeInputReader {
     sender: UnboundedSender<InputReaderCommand>,
+    /// Set by the worker as it returns, so that dropping the reader can wait for
+    /// the DuckDB work to stop rather than exit with a query in flight.
+    finished: Arc<AtomicBool>,
+}
+
+impl Drop for DuckLakeInputReader {
+    fn drop(&mut self) {
+        // The worker may be in the middle of a DuckDB call.  Letting the process
+        // tear down the library underneath it segfaults, so ask it to stop and
+        // wait — bounded, because a wedged worker must not hang shutdown.
+        let _ = self.sender.send(InputReaderCommand::Disconnect);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !self.finished.load(Ordering::Acquire) {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 impl InputReader for DuckLakeInputReader {
@@ -170,18 +193,32 @@ pub fn open(
         table: config.table.clone(),
     };
     let state = ReaderState::from_metadata(resume.as_ref());
+    // The interval is the pipeline's decision, so it is read here rather than
+    // fixed: a test and a low-latency pipeline want very different values.
+    let poll_interval: Duration = config.poll_interval().into();
 
     let (sender, receiver) = unbounded_channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = Arc::clone(&finished);
     thread::Builder::new()
         .name(format!("ducklake-input-{endpoint_name}"))
         .spawn(move || {
-            if let Err(error) = run(table, stream, consumer.as_ref(), receiver, state) {
+            let result = run(
+                table,
+                stream,
+                consumer.as_ref(),
+                receiver,
+                state,
+                poll_interval,
+            );
+            worker_finished.store(true, Ordering::Release);
+            if let Err(error) = result {
                 consumer.error(true, error, None);
             }
         })
         .context("spawning the DuckLake reader")?;
 
-    Ok(Box::new(DuckLakeInputReader { sender }))
+    Ok(Box::new(DuckLakeInputReader { sender, finished }))
 }
 
 /// Everything needed to address one table in a catalog.
@@ -323,6 +360,27 @@ impl<'a> ReaderCatalog<'a> {
         })
     }
 
+    /// Re-attach the catalog, so that commits made since the last poll become
+    /// visible.
+    ///
+    /// DuckLake reads the catalog's metadata when the catalog is *attached* and
+    /// keeps answering from that copy: an attachment that stays open keeps
+    /// reporting the snapshot it saw at attach time, so a reader that never
+    /// re-attached would follow nothing at all after its bootstrap gap (measured
+    /// against a file catalog: a writer committing in another DuckDB instance
+    /// left a long-lived attachment reporting the old snapshot).  There is no
+    /// notification primitive to wait on instead, and re-attaching is cheap — a
+    /// metadata read of a small DuckDB file.
+    ///
+    /// This must run outside a transaction: DuckDB refuses `ATTACH` inside one.
+    fn refresh(&self) -> AnyResult<()> {
+        let alias = quote_ident(&self.catalog.alias)?;
+        let _ = self.conn.execute(&format!("DETACH {alias}"), &[]);
+        self.conn
+            .execute(&attach_statement(&self.catalog, true)?, &[])
+            .with_context(|| format!("re-attaching catalog {:?}", self.catalog.catalog))
+    }
+
     /// `ducklake_current_snapshot` — the last *committed* snapshot, which is also
     /// the snapshot this transaction reads (see the module docs for why not
     /// `ducklake_last_committed_snapshot`).
@@ -368,6 +426,7 @@ pub(super) fn advance(
     sink: &mut dyn FnMut(&str, &str) -> AnyResult<()>,
     state: ReaderState,
 ) -> AnyResult<ReaderState> {
+    catalog.refresh()?;
     catalog.transaction(|catalog| {
         let current = catalog.current_snapshot()?;
         if !state.bootstrapped {
@@ -414,6 +473,7 @@ fn run(
     consumer: &dyn InputConsumer,
     mut receiver: UnboundedReceiver<InputReaderCommand>,
     mut state: ReaderState,
+    poll_interval: Duration,
 ) -> AnyResult<()> {
     let mut catalog = ReaderCatalog::attach(&table.catalog)?;
     let mut extending = true;
@@ -462,7 +522,7 @@ fn run(
             }
         }
         thread::sleep(if stream.len().is_empty() {
-            POLL_INTERVAL
+            poll_interval
         } else {
             FLUSH_INTERVAL
         });
