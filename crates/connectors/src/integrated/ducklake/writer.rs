@@ -167,6 +167,31 @@ impl DuckLakeWriter {
         })
     }
 
+    /// Attach the catalog and resolve the output table, once.
+    ///
+    /// An integrated endpoint never gets `connect` from the controller: the
+    /// controller creates it with [`create_integrated_output_endpoint`] and then
+    /// takes [`IntegratedOutputEndpoint::into_encoder`], so the object that runs
+    /// the steps has had no connection attempt.  The setup therefore happens on
+    /// first use.  `connect` does the same work for a caller that does call it;
+    /// both are idempotent.
+    fn ensure_connected(&mut self) -> AnyResult<()> {
+        if self.catalog.is_some() {
+            return Ok(());
+        }
+        self.target = Some(self.resolve_target()?);
+        let catalog = Catalog::open(&self.config)?;
+        tracing::info!(
+            "ducklake: {} attached {:?} at frontier {} epoch {}",
+            self.endpoint_name,
+            self.config.catalog.catalog,
+            catalog.frontier(),
+            catalog.epoch()
+        );
+        self.catalog = Some(catalog);
+        Ok(())
+    }
+
     /// Publish the batch in flight, or report and hold.
     fn publish_pending(&mut self) {
         let Some(step) = self.pending.step else {
@@ -192,6 +217,7 @@ impl DuckLakeWriter {
     }
 
     fn publish(&mut self, step: Step, deltas: Vec<Delta>, resync: bool) -> AnyResult<()> {
+        self.ensure_connected()?;
         let catalog = self
             .catalog
             .as_mut()
@@ -374,6 +400,7 @@ impl Encoder for DuckLakeWriter {
         // A step whose rows cancel out arrives with content that nets to
         // nothing; publishing it would still advance the frontier, which is
         // correct, so the deltas are collected even when they are empty.
+        self.ensure_connected()?;
         let deltas = self.collect_deltas(&batch)?;
         self.pending.deltas = deltas;
         Ok(())
@@ -383,16 +410,7 @@ impl Encoder for DuckLakeWriter {
 impl OutputEndpoint for DuckLakeWriter {
     fn connect(&mut self, callbacks: Arc<dyn OutputEndpointCallbacks>) -> AnyResult<()> {
         self.callbacks = Some(callbacks);
-        self.target = Some(self.resolve_target()?);
-        let catalog = Catalog::open(&self.config)?;
-        tracing::info!(
-            "ducklake: {} attached {:?} at frontier {} epoch {}",
-            self.endpoint_name,
-            self.config.catalog.catalog,
-            catalog.frontier(),
-            catalog.epoch()
-        );
-        self.catalog = Some(catalog);
+        self.ensure_connected()?;
         Ok(())
     }
 

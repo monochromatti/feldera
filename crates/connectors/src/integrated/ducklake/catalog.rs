@@ -522,7 +522,7 @@ pub(crate) fn sql_literal(value: &str) -> Result<String> {
     Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Catalog {
     /// Run a statement for a test that needs a table to exist.
     ///

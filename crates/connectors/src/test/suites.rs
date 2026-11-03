@@ -22,6 +22,7 @@ pub use crate::integrated::delta_table::output::parallel as delta_output;
 #[cfg(feature = "with-deltalake")]
 pub use crate::integrated::delta_table::test as delta_table;
 #[cfg(feature = "with-dynamodb")]
+pub use crate::integrated::ducklake::test as ducklake;
 pub use crate::integrated::dynamodb::test as dynamodb;
 #[cfg(feature = "with-postgres-cdc")]
 pub use crate::integrated::postgres::cdc_input::tests as postgres_cdc_destination;
