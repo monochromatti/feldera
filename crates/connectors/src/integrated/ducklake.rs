@@ -49,6 +49,8 @@
 mod catalog;
 mod ffi;
 mod protocol;
+#[cfg(test)]
+mod tests_live;
 mod writer;
 
 pub use writer::DuckLakeWriter;
