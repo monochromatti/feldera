@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow, bail};
-use feldera_types::transport::ducklake::DuckLakeWriterConfig;
+use feldera_types::transport::ducklake::{DuckLakeCatalogConfig, DuckLakeWriterConfig};
 
 use super::ffi::{Conn, Db, Library, Value};
 use super::protocol::{self, Batch, Decision, Delta, Guard, Op};
@@ -122,24 +122,7 @@ impl Catalog {
             conn.execute("LOAD ducklake", &[])?;
         }
 
-        let mut options = Vec::new();
-        if let Some(data_path) = &cdc.data_path {
-            options.push(format!("DATA_PATH {}", sql_literal(data_path)?));
-        }
-        if let Some(limit) = cdc.inlining_row_limit {
-            options.push(format!("DATA_INLINING_ROW_LIMIT {limit}"));
-        }
-        let suffix = if options.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", options.join(", "))
-        };
-        let attach = format!(
-            "ATTACH {} AS {}{suffix}",
-            sql_literal(&cdc.catalog)?,
-            quote_ident(&cdc.alias)?
-        );
-        conn.execute(&attach, &[])
+        conn.execute(&attach_statement(cdc, false)?, &[])
             .with_context(|| format!("attaching catalog {:?}", cdc.catalog))?;
 
         let mut keys = BTreeMap::new();
@@ -501,11 +484,38 @@ struct Attempt {
     guard: Guard,
 }
 
+/// The `ATTACH` statement for a catalog, which the reader and the writer share.
+///
+/// `read_only` is what makes a reader safe: it cannot write the guard row, an
+/// output table, or anything else, whatever the code above it does.
+pub(crate) fn attach_statement(cdc: &DuckLakeCatalogConfig, read_only: bool) -> Result<String> {
+    let mut options = Vec::new();
+    if read_only {
+        options.push("READ_ONLY".to_string());
+    }
+    if let Some(data_path) = &cdc.data_path {
+        options.push(format!("DATA_PATH {}", sql_literal(data_path)?));
+    }
+    if let Some(limit) = cdc.inlining_row_limit {
+        options.push(format!("DATA_INLINING_ROW_LIMIT {limit}"));
+    }
+    let suffix = if options.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", options.join(", "))
+    };
+    Ok(format!(
+        "ATTACH {} AS {}{suffix}",
+        sql_literal(&cdc.catalog)?,
+        quote_ident(&cdc.alias)?
+    ))
+}
+
 /// Render a string as a SQL literal.
 ///
 /// `ATTACH` takes its target and `DATA_PATH` as literals rather than as bound
 /// parameters, so the value is quoted here with the standard doubling rule.
-fn sql_literal(value: &str) -> Result<String> {
+pub(crate) fn sql_literal(value: &str) -> Result<String> {
     if value.contains('\0') {
         bail!("SQL literal contains a NUL byte: {value:?}");
     }

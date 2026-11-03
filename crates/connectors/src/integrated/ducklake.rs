@@ -49,13 +49,14 @@
 mod catalog;
 mod ffi;
 mod protocol;
+mod reader;
 #[cfg(test)]
 mod tests_live;
 mod writer;
 
 pub use writer::DuckLakeWriter;
 
-use anyhow::{Result as AnyResult, anyhow};
+use anyhow::Result as AnyResult;
 use feldera_adapterlib::catalog::InputCollectionHandle;
 use feldera_types::config::FtModel;
 use feldera_types::transport::ducklake::DuckLakeReaderConfig;
@@ -100,14 +101,16 @@ impl InputEndpoint for DuckLakeInputEndpoint {
 impl IntegratedInputEndpoint for DuckLakeInputEndpoint {
     fn open(
         self: Box<Self>,
-        _input_handle: &InputCollectionHandle,
-        _resume_info: Option<serde_json::Value>,
+        input_handle: &InputCollectionHandle,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
-        Err(anyhow!(
-            "the DuckLake input connector (endpoint {}, table {}.{}) is not implemented yet",
-            self.endpoint_name,
-            self.config.catalog.schema,
-            self.config.table
-        ))
+        reader::open(
+            &self.endpoint_name,
+            self.config,
+            &input_handle.schema,
+            input_handle,
+            self.consumer,
+            resume_info,
+        )
     }
 }

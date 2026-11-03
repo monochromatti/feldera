@@ -29,6 +29,7 @@ use serde_json::json;
 
 use super::catalog::Catalog;
 use super::protocol::{Batch, Decision, Delta, Op};
+use super::reader::{ReaderCatalog, ReaderState, Table, advance};
 
 /// A writer config pointing at a fresh catalog, or `None` when the integration
 /// environment is not set up.
@@ -146,4 +147,119 @@ fn the_frontier_survives_reopening_the_catalog() {
         Some("2"),
         "a replay after restart applied nothing"
     );
+}
+
+/// The projection the reader builds from a relation, for the two-column test
+/// table.  Spelled out here so the test fails if the reader's projection stops
+/// matching what `to_json` needs.
+const PROJECTION: &str = r#"{'id': "id", 'name': "name"}"#;
+
+/// Run one read attempt and collect what it handed on.
+fn advance_once(
+    config: &DuckLakeWriterConfig,
+    state: ReaderState,
+) -> (Vec<(String, String)>, ReaderState) {
+    let catalog = ReaderCatalog::attach(&config.catalog).expect("attach the catalog read-only");
+    let table = Table::new(&config.catalog, "main", "orders", PROJECTION).expect("a table address");
+    let mut pushed = Vec::new();
+    let next = {
+        let mut sink = |change_type: &str, json: &str| {
+            pushed.push((change_type.to_owned(), json.to_owned()));
+            Ok(())
+        };
+        advance(&catalog, &table, &mut sink, state).expect("one read attempt")
+    };
+    (pushed, next)
+}
+
+/// Commit `sql` through a writer connection, then let go of the catalog so the
+/// reader can attach to it (a file catalog admits one process).
+fn seed(config: &DuckLakeWriterConfig, sql: &str) {
+    let mut catalog = Catalog::open(config).expect("attach the catalog for writing");
+    catalog.execute_sql(sql).expect("seed the catalog");
+}
+
+/// The bootstrap read returns the table and remembers the snapshot it read, so
+/// the next attempt does not read it again — the failure this prevents is a
+/// restart that re-reads the whole table and doubles every count.
+#[test]
+fn bootstrap_reads_the_table_once_and_records_its_snapshot() {
+    let Some(config) = live_config("bootstrap") else {
+        return;
+    };
+    seed(
+        &config,
+        "CREATE TABLE dl.main.orders (id INT, name VARCHAR); \
+         INSERT INTO dl.main.orders VALUES (1, 'a'), (2, 'b')",
+    );
+
+    let (pushed, state) = advance_once(&config, ReaderState::default());
+    assert!(state.bootstrapped, "the first attempt bootstraps");
+    assert!(
+        state.snapshot >= 2,
+        "the snapshot of the last commit is recorded, got {}",
+        state.snapshot
+    );
+    assert_eq!(
+        pushed
+            .iter()
+            .map(|(_, json)| json.as_str())
+            .collect::<Vec<_>>(),
+        vec![r#"{"id":1,"name":"a"}"#, r#"{"id":2,"name":"b"}"#],
+        "both rows, as JSON"
+    );
+
+    let (again, state_again) = advance_once(&config, state);
+    assert!(
+        again.is_empty(),
+        "nothing new happened, so nothing is replayed"
+    );
+    assert_eq!(state_again, state, "the snapshot does not move on its own");
+}
+
+/// A commit after the bootstrap is replayed with one weight per row, and the
+/// window is not read twice.  An update arrives as a preimage/postimage pair —
+/// the writer's reason for emitting updates rather than delete+insert.
+#[test]
+fn a_new_snapshot_is_replayed_with_its_change_types() {
+    let Some(config) = live_config("changes") else {
+        return;
+    };
+    seed(
+        &config,
+        "CREATE TABLE dl.main.orders (id INT, name VARCHAR); \
+         INSERT INTO dl.main.orders VALUES (1, 'a'), (2, 'b')",
+    );
+    let (_, state) = advance_once(&config, ReaderState::default());
+
+    seed(
+        &config,
+        "BEGIN; UPDATE dl.main.orders SET name = 'a2' WHERE id = 1; \
+         DELETE FROM dl.main.orders WHERE id = 2; \
+         INSERT INTO dl.main.orders VALUES (3, 'c'); COMMIT",
+    );
+
+    let (pushed, state) = advance_once(&config, state);
+    let mut got = pushed.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("delete".to_owned(), r#"{"id":2,"name":"b"}"#.to_owned()),
+            ("insert".to_owned(), r#"{"id":3,"name":"c"}"#.to_owned()),
+            (
+                "update_postimage".to_owned(),
+                r#"{"id":1,"name":"a2"}"#.to_owned()
+            ),
+            (
+                "update_preimage".to_owned(),
+                r#"{"id":1,"name":"a"}"#.to_owned()
+            ),
+        ],
+        "one row per change, with the change type the weight comes from"
+    );
+
+    let (again, state_again) = advance_once(&config, state);
+    assert!(again.is_empty(), "the applied window is not replayed");
+    assert_eq!(state_again, state);
 }
