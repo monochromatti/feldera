@@ -213,6 +213,8 @@ tokio-stream = { workspace = true, features = ["sync"] }
 home = { workspace = true }
 datafusion = { workspace = true }
 sha2 = { workspace = true }
+# DuckLake batch digests are hex-encoded in the guard row.
+hex = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true, features = ["with-serde"] }
 serde_bytes = { workspace = true }

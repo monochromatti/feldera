@@ -4432,6 +4432,7 @@ dependencies = [
  "gcloud-metadata",
  "gcloud-pubsub",
  "governor",
+ "hex",
  "home",
  "inventory",
  "itertools 0.14.0",
