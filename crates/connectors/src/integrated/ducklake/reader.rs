@@ -483,15 +483,21 @@ fn run(
                 Ok(InputReaderCommand::Extend) => extending = true,
                 Ok(InputReaderCommand::Pause) => extending = false,
                 Ok(InputReaderCommand::Queue { .. }) => {
+                    // Always answer the `Queue`, even with nothing buffered: the
+                    // controller's step waits for this signal, so staying silent
+                    // when the catalog had no news deadlocks the pipeline.  A
+                    // reader that has not bootstrapped yet has no resume point to
+                    // offer, which is what `Resume::Barrier` says.
                     let amt = stream.len();
                     if !amt.is_empty() {
                         stream.flush()?;
-                        consumer.extended(
-                            amt,
-                            Some(Resume::new_metadata_only(state.to_metadata(), None)),
-                            vec![],
-                        );
                     }
+                    let resume = if state.bootstrapped {
+                        Resume::new_metadata_only(state.to_metadata(), None)
+                    } else {
+                        Resume::Barrier
+                    };
+                    consumer.extended(amt, Some(resume), vec![]);
                 }
                 Ok(InputReaderCommand::Replay { metadata, .. }) => {
                     // The controller replays from a checkpoint: drop whatever is

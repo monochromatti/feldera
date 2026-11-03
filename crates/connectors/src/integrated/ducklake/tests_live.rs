@@ -454,23 +454,33 @@ impl RecordingConsumer {
         self.events.lock().unwrap().clone()
     }
 
+    /// The `Extended` events that carried rows.  Every `Queue` is answered now —
+    /// a silent one would stall the controller — so the flushes have to be picked
+    /// out of the acknowledgements.
+    fn flushes(&self) -> Vec<Event> {
+        self.events()
+            .into_iter()
+            .filter(|event| !matches!(event, Event::Extended { records: 0, .. }))
+            .collect()
+    }
+
     fn push(&self, event: Event) {
         self.events.lock().unwrap().push(event);
     }
 
-    /// The snapshot the `n`th `Extended` carried.
-    fn resume_snapshot(&self, n: usize) -> u64 {
-        match self.events().get(n) {
+    /// The snapshot the `n`th flush carried.
+    fn flush_snapshot(&self, n: usize) -> u64 {
+        match self.flushes().get(n) {
             Some(Event::Extended {
                 resume: Some(snapshot),
                 ..
             }) => *snapshot,
-            other => panic!("event {n} is not an extended with a snapshot: {other:?}"),
+            other => panic!("flush {n} is not an extended with a snapshot: {other:?}"),
         }
     }
 
     fn metadata(&self, n: usize) -> serde_json::Value {
-        json!({ "snapshot": self.resume_snapshot(n), "bootstrapped": true })
+        json!({ "snapshot": self.flush_snapshot(n), "bootstrapped": true })
     }
 }
 
@@ -494,6 +504,9 @@ impl InputConsumer for RecordingConsumer {
     fn extended(&self, amt: BufferSize, resume: Option<Resume>, _watermarks: Vec<Watermark>) {
         let snapshot = match resume {
             Some(Resume::Seek { seek }) => seek.get("snapshot").and_then(|s| s.as_u64()),
+            // A reader that has not bootstrapped yet has no snapshot to resume
+            // from, and says so instead of inventing one.
+            Some(Resume::Barrier) => None,
             other => panic!("the reader must resume by metadata only, got {other:?}"),
         };
         self.push(Event::Extended {
@@ -623,12 +636,12 @@ fn the_loop_bootstraps_once_and_replays_from_the_checkpoint_it_reported() {
     // Bootstrap: `Extend` reads, and the controller's repeated `Queue` flushes.
     reader.request(InputReaderCommand::Extend);
     pump("the bootstrap to be flushed", &*reader, || {
-        !consumer.events().is_empty()
+        !consumer.flushes().is_empty()
     });
 
-    let bootstrap_snapshot = consumer.resume_snapshot(0);
+    let bootstrap_snapshot = consumer.flush_snapshot(0);
     assert_eq!(
-        consumer.events()[0],
+        consumer.flushes()[0],
         Event::Extended {
             records: 2,
             resume: Some(bootstrap_snapshot)
@@ -648,13 +661,13 @@ fn the_loop_bootstraps_once_and_replays_from_the_checkpoint_it_reported() {
     seed(&config, "INSERT INTO dl.main.orders VALUES (3, 'c')");
     reader.request(InputReaderCommand::Extend);
     pump("the new commit to be flushed", &*reader, || {
-        consumer.events().len() >= 2
+        consumer.flushes().len() >= 2
     });
     assert_eq!(
-        consumer.events()[1],
+        consumer.flushes()[1],
         Event::Extended {
             records: 1,
-            resume: Some(consumer.resume_snapshot(1))
+            resume: Some(consumer.flush_snapshot(1))
         },
         "only the new row"
     );
@@ -662,6 +675,23 @@ fn the_loop_bootstraps_once_and_replays_from_the_checkpoint_it_reported() {
         consumed.lock().unwrap()[2..],
         [(true, r#"{"id":3,"name":"c"}"#.to_owned())],
         "the commit's row, appended after the bootstrap"
+    );
+
+    // An idle `Queue` is still answered: the controller's step waits for the
+    // signal, so a reader that says nothing when there is no news deadlocks the
+    // pipeline instead of pausing cleanly.  It reports no rows and keeps its
+    // resume point.
+    let idle = consumer.events().len();
+    pump("the idle queue to be answered", &*reader, || {
+        consumer.events().len() > idle
+    });
+    assert_eq!(
+        consumer.events()[idle],
+        Event::Extended {
+            records: 0,
+            resume: Some(consumer.flush_snapshot(1)),
+        },
+        "an idle queue is answered without inventing rows"
     );
 
     // Replaying the *bootstrap* checkpoint must re-read the change since it, not
@@ -673,20 +703,15 @@ fn the_loop_bootstraps_once_and_replays_from_the_checkpoint_it_reported() {
     wait_for("the replay to be reported", || {
         consumer.events().contains(&Event::Replayed)
     });
+    // The replay truncates the buffered rows, not the ones already flushed.
     let before = consumed.lock().unwrap().len();
-    assert_eq!(
-        before, 3,
-        "a replay drops the buffered rows it will re-read"
-    );
+    assert_eq!(before, 3, "a replay keeps the rows it already flushed");
 
     reader.request(InputReaderCommand::Extend);
+    // Wait for the re-read to be *flushed*, not merely for a queue to be
+    // answered: an answered `Queue` is not a row.
     pump("the replayed window to be flushed", &*reader, || {
-        consumer
-            .events()
-            .iter()
-            .filter(|event| matches!(event, Event::Extended { .. }))
-            .count()
-            >= 3
+        consumed.lock().unwrap().len() > before
     });
     assert_eq!(
         consumed.lock().unwrap()[before..],
