@@ -50,6 +50,8 @@ mod catalog;
 mod ffi;
 mod protocol;
 mod reader;
+#[cfg(any(test, feature = "testing"))]
+pub mod test;
 #[cfg(test)]
 mod tests_live;
 mod writer;
