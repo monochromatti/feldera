@@ -296,6 +296,11 @@ const connectors = {
                 },
                 {
                     type: 'doc',
+                    id: 'connectors/sources/ducklake',
+                    label: 'DuckLake'
+                },
+                {
+                    type: 'doc',
                     id: 'connectors/sources/iceberg',
                     label: 'Apache Iceberg'
                 },
@@ -368,6 +373,11 @@ const connectors = {
                     type: 'doc',
                     id: 'connectors/sinks/delta',
                     label: 'Delta Lake'
+                },
+                {
+                    type: 'doc',
+                    id: 'connectors/sinks/ducklake',
+                    label: 'DuckLake'
                 },
                 {
                     type: 'doc',
