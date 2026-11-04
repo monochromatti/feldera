@@ -489,14 +489,8 @@ fn run(
                     // reader that has not bootstrapped yet has no resume point to
                     // offer, which is what `Resume::Barrier` says.
                     let amt = stream.len();
-                    if !amt.is_empty() {
-                        stream.flush()?;
-                    }
-                    let resume = if state.bootstrapped {
-                        Resume::new_metadata_only(state.to_metadata(), None)
-                    } else {
-                        Resume::Barrier
-                    };
+                    stream.flush()?;
+                    let resume = Resume::new_metadata_only(state.to_metadata(), None);
                     consumer.extended(amt, Some(resume), vec![]);
                 }
                 Ok(InputReaderCommand::Replay { metadata, .. }) => {
@@ -517,7 +511,12 @@ fn run(
             }
         }
 
-        if extending && stream.len().is_empty() {
+        // Poll regardless of `extending`: the controller sends `Extend` only
+        // when it already expects data, so gating the poll on it would stop the
+        // poll for good after the first step and the connector would never see
+        // another commit.  `Pause` is honoured where it matters — nothing is
+        // handed to the controller except in answer to `Queue`.
+        if stream.len().is_empty() {
             let mut sink = |change_type: &str, json: &str| match change_type {
                 "insert" | "update_postimage" => stream.insert(json.as_bytes(), &None),
                 _ => stream.delete(json.as_bytes(), &None),
@@ -525,6 +524,11 @@ fn run(
             let next = advance(&catalog, &table, &mut sink, state)?;
             if next != state {
                 state = next;
+                // Nothing else tells the controller that the catalog had news:
+                // without this the pipeline parks with the rows still buffered
+                // in the stream.  The `clock` connector asks for steps the same
+                // way, on every tick that produces something.
+                consumer.request_step();
             }
         }
         thread::sleep(if stream.len().is_empty() {

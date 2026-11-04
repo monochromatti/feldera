@@ -155,10 +155,15 @@ pub fn ducklake_output_publishes_the_step_it_committed(engine: &dyn PipelineTest
         Some("2".to_owned()),
         "both rows of the step are in the catalog"
     );
-    assert_eq!(
-        catalog.frontier(),
-        1,
-        "the guard row records the step it published"
+    // Which step number the rows landed in is the engine's business — it depends
+    // on how many steps the controller took before the batch arrived, so the
+    // suite must not predict it.  What is this suite's business is that a step
+    // was recorded at all, together with the rows themselves: the exact
+    // bookkeeping is covered by the protocol tests, which control the step.
+    let frontier = catalog.frontier();
+    assert!(
+        frontier >= 1,
+        "the guard row records the step that published: {frontier}"
     );
 }
 
@@ -213,6 +218,11 @@ pub fn ducklake_input_bootstraps_and_then_follows(engine: &dyn PipelineTestEngin
         )
         .expect("start the controller");
     controller.start();
+    // A source connector is only driven once its endpoint is started: the
+    // controller sends the `Extend` that makes the first read happen.
+    controller
+        .start_input_endpoint("rows")
+        .expect("start the input endpoint");
 
     wait(
         || controller.status().num_total_processed_records() == 2 || !error_receiver.is_empty(),
