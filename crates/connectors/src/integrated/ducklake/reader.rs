@@ -476,18 +476,22 @@ fn run(
     poll_interval: Duration,
 ) -> AnyResult<()> {
     let mut catalog = ReaderCatalog::attach(&table.catalog)?;
-    let mut extending = true;
     loop {
         loop {
             match receiver.try_recv() {
-                Ok(InputReaderCommand::Extend) => extending = true,
-                Ok(InputReaderCommand::Pause) => extending = false,
+                // `Extend` and `Pause` do not gate the poll: the controller
+                // sends `Extend` only when it already expects data, so honouring
+                // it as a poll switch would stop the poll for good after the
+                // first step.  Nothing is handed over except in answer to
+                // `Queue`, which is where `Pause` takes effect.
+                Ok(InputReaderCommand::Extend | InputReaderCommand::Pause) => {}
                 Ok(InputReaderCommand::Queue { .. }) => {
                     // Always answer the `Queue`, even with nothing buffered: the
                     // controller's step waits for this signal, so staying silent
-                    // when the catalog had no news deadlocks the pipeline.  A
-                    // reader that has not bootstrapped yet has no resume point to
-                    // offer, which is what `Resume::Barrier` says.
+                    // when the catalog had no news deadlocks the pipeline.  The
+                    // state carried is the last snapshot actually read, which
+                    // before the first read is snapshot 0 — the state the
+                    // catalog starts from, not a claim that anything ran.
                     let amt = stream.len();
                     stream.flush()?;
                     let resume = Resume::new_metadata_only(state.to_metadata(), None);
