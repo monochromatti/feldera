@@ -90,6 +90,7 @@ pub fn create_integrated_output_endpoint(
             controller,
             shutdown,
             continue_previous_state,
+            connector_config.output_buffer_config.enable_output_buffer,
         )?),
         #[cfg(feature = "with-dynamodb")]
         TransportConfig::DynamoDBOutput(config) => Box::new(DynamoDBOutputEndpoint::new(

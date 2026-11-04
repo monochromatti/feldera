@@ -111,7 +111,19 @@ impl DuckLakeWriter {
         controller: Weak<ControllerInner>,
         shutdown: CancellationToken,
         _continue_previous_state: bool,
+        enable_output_buffer: bool,
     ) -> Result<Self, ControllerError> {
+        // A buffered step is a different step: the controller would hand this
+        // writer a batch covering several steps, and the guard row can name only
+        // one.  Refusing at construction is better than publishing output the
+        // catalog cannot account for.
+        if enable_output_buffer {
+            return Err(ControllerError::NotSupported {
+                error: "enable_output_buffer on a DuckLake output: the connector publishes one \
+                        step per transaction, so a batch must not span steps"
+                    .to_string(),
+            });
+        }
         Ok(Self {
             endpoint_id,
             endpoint_name: endpoint_name.to_string(),
@@ -489,6 +501,7 @@ mod tests {
             &Relation::empty(),
             Weak::new(),
             CancellationToken::new(),
+            false,
             false,
         )
         .expect("writer")
