@@ -39,12 +39,26 @@ pub struct PublicationResult {
 /// is why they are listed rather than inferred.
 fn is_transaction_conflict(message: &str) -> bool {
     let lower = message.to_lowercase();
+    // A *missing* object named like a conflict is not a conflict.  Without this,
+    // a table called `conflicts` produces "Table with name conflicts does not
+    // exist", is retried eight times, and is then reported as a publication that
+    // "did not converge" — hiding a configuration error behind a convergence
+    // failure, which is the wrong thing to page an operator for.
+    if lower.contains("does not exist") || lower.contains("not found") {
+        return false;
+    }
     [
         "conflict",
         "transactioncontext",
         "failed to commit",
         "optimistic",
         "write-write",
+        // PostgreSQL's own spellings of a serialization failure, in case the
+        // catalog surfaces the server message rather than DuckLake's wrapper.
+        "40001",
+        "could not serialize",
+        "deadlock",
+        "catalog version",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -364,6 +378,20 @@ impl Catalog {
                     continue;
                 }
             };
+            // A decision that is not `Apply` writes nothing, so the transaction
+            // is rolled back rather than committed, and the guard is returned as
+            // it was read.  It used to be committed and reported as
+            // `advance(guard, batch)`, which told the operator the frontier the
+            // *batch* wanted instead of the one the guard holds — the number that
+            // decides between a reset and a takeover.
+            if result.decision != Decision::Apply {
+                let _ = self.conn.execute("ROLLBACK", &[]);
+                return Ok(PublicationResult {
+                    guard: result.guard,
+                    decision: result.decision,
+                    attempts: attempt,
+                });
+            }
             // `COMMIT` is part of the attempt, not a formality after it.  DuckLake
             // detects a write-write race at commit — that is what an optimistic
             // catalog commit is — so retrying only the statements before it would

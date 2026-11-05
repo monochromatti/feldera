@@ -229,6 +229,15 @@ pub fn decide(guard: &Guard, batch: &Batch) -> Result<Decision> {
     if guard.frontier > batch.end {
         // A newer transaction is already published.  The engine can replay an
         // older step; applying it would move the group's content backwards.
+        //
+        // This check comes *after* the resync branch below, because a resync is
+        // not a step in a sequence: it is the whole content as of `end`.  A
+        // restart renumbers steps, so its first snapshot can arrive with an `end`
+        // far behind the guard's frontier, and refusing that would wedge the one
+        // path that recovers.
+        if batch.resync {
+            return Ok(Decision::Apply);
+        }
         return Ok(Decision::Stale);
     }
     if guard.frontier == batch.end {

@@ -125,6 +125,16 @@ impl DuckLakeWriter {
                  property from the view, or use a connector that supports it.",
             ));
         }
+        // Several tables may be configured for one endpoint, and each endpoint
+        // publishes only the table its view names (`resolve_target`).  That is
+        // safe because the guard is per `output_group`; what is *not* safe is two
+        // endpoints sharing one group, and the engine gives each endpoint its own
+        // transaction, so neither of them can publish the group's content in one
+        // commit.  The reference implementation can, because it assembles a group
+        // before publishing; this endpoint cannot, so one group must carry exactly
+        // one publishing endpoint.  That is a deployment rule the connector cannot
+        // check from inside a single endpoint's configuration.
+        let _ = &config.tables;
         // A buffered step is a different step: the controller would hand this
         // writer a batch covering several steps, and the guard row can name only
         // one.  Refusing at construction is better than publishing output the
@@ -255,7 +265,12 @@ impl DuckLakeWriter {
         // engine skipped (one with no output) is not mistaken for a gap.
         // A guard row that cannot be read must stop the publication: defaulting to
         // frontier 0 would make every batch look like a duplicate of the first one.
-        let base = catalog.frontier()?;
+        //
+        // A resync is based on nothing rather than on the frontier: it is the whole
+        // content as of `step`, so it must apply from any frontier, which is what
+        // makes it the recovery path after a restart.  The reference implementation
+        // publishes it the same way.
+        let base = if resync { 0 } else { catalog.frontier()? };
         let batch = Batch {
             output_group: self.config.output_group.clone(),
             generation: self.config.generation.clone(),
@@ -444,8 +459,23 @@ impl Encoder for DuckLakeWriter {
         // A step whose rows cancel out arrives with content that nets to
         // nothing; publishing it would still advance the frontier, which is
         // correct, so the deltas are collected even when they are empty.
-        self.ensure_connected()?;
-        let deltas = self.collect_deltas(&batch)?;
+        let deltas = match self
+            .ensure_connected()
+            .and_then(|()| self.collect_deltas(&batch))
+        {
+            Ok(deltas) => deltas,
+            Err(e) => {
+                // Holding here is the only place this loss can be stopped.  The
+                // controller reports an encoder error non-fatally and calls
+                // `batch_end` afterwards, and a `batch_end` with nothing collected
+                // is indistinguishable from a step whose rows cancelled out — so
+                // an error that is merely returned lets the step be counted as
+                // published while nothing was written.  The reference connector
+                // raises and stops for the same reason.
+                self.fail_and_hold(e);
+                return Ok(());
+            }
+        };
         self.pending.deltas = deltas;
         Ok(())
     }
