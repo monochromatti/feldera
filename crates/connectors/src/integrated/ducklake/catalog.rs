@@ -251,11 +251,26 @@ impl Catalog {
         }
         let row = &rows[0];
         let cell = |i: usize| row.get(i).cloned().flatten();
+        // Parsed rather than defaulted: a NULL or non-numeric cell used to become
+        // 0, which then made the conditional guard `UPDATE` match no row and
+        // surface as "the guard did not advance" — the right refusal, with a
+        // cause that sent the operator looking in the wrong place.
+        let number = |i: usize, column: &str| -> Result<u64> {
+            let text = cell(i).with_context(|| {
+                format!("guard row of {:?} has no {column}", self.output_group)
+            })?;
+            text.parse().with_context(|| {
+                format!(
+                    "guard row of {:?} has a non-numeric {column}: {text:?}",
+                    self.output_group
+                )
+            })
+        };
         Ok(Guard {
             output_group: cell(0).unwrap_or_default(),
             generation: cell(1).unwrap_or_default(),
-            epoch: cell(2).and_then(|v| v.parse().ok()).unwrap_or(0),
-            frontier: cell(3).and_then(|v| v.parse().ok()).unwrap_or(0),
+            epoch: number(2, "epoch")?,
+            frontier: number(3, "frontier")?,
             batch_id: cell(4),
             digest: cell(5),
         })

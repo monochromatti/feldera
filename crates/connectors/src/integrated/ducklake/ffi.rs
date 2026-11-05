@@ -149,13 +149,20 @@ impl Library {
     /// silently-picked system `libduckdb` is a version mismatch waiting to
     /// happen.
     pub fn load() -> Result<&'static Library> {
-        static LIB: std::sync::OnceLock<std::result::Result<Library, String>> =
-            std::sync::OnceLock::new();
-        let loaded = LIB.get_or_init(|| Self::load_uncached().map_err(|e| format!("{e:#}")));
-        match loaded {
-            Ok(lib) => Ok(lib),
-            Err(e) => Err(anyhow!("{e}")),
+        // Only a successful load is cached.  A failure says nothing about the
+        // rest of the process's life — the library may be installed, or
+        // `DUCKLAKE_DUCKDB_LIB` set, after the first pipeline was built — and
+        // this used to pin the first attempt's error for the whole process.
+        static LIB: std::sync::OnceLock<Library> = std::sync::OnceLock::new();
+        if let Some(lib) = LIB.get() {
+            return Ok(lib);
         }
+        let loaded = Self::load_uncached()?;
+        // If another thread installed one first, keep theirs: dropping ours only
+        // decrements the `dlclose` reference count on the same library.
+        let _ = LIB.set(loaded);
+        LIB.get()
+            .ok_or_else(|| anyhow!("the DuckDB library could not be retained"))
     }
 
     fn load_uncached() -> Result<Library> {
@@ -452,6 +459,7 @@ mod dlflags {
     pub const RTLD_LOCAL: i32 = 0x0;
 }
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> i32;
