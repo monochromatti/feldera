@@ -105,6 +105,21 @@ use super::{
 /// step cannot start until the buffered rows are flushed, so this is short.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(2);
 
+/// How long the loop sleeps between checks for a controller command.
+///
+/// The sleep is what made a step wait for the whole poll interval; slicing it keeps
+/// the wake-up latency at this value while costing one `try_recv` per slice.
+const HANDOFF_SLICE: Duration = Duration::from_millis(2);
+
+/// How many rows may sit in the stream before the poll stops adding to it.
+///
+/// The controller asks for a step with `Queue`; while it is paused it asks for
+/// nothing, so an unbounded buffer would grow with every commit for as long as the
+/// pipeline is suspended.  Stopping the poll at a bound is free: `state` only
+/// advances for rows that were pushed, so nothing is skipped — it is only read
+/// after the `Queue` that drains the buffer.
+const MAX_BUFFERED: usize = 100_000;
+
 /// Where the reader stopped, as stored in a checkpoint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub(super) struct ReaderState {
@@ -138,9 +153,11 @@ pub struct DuckLakeInputReader {
 
 impl Drop for DuckLakeInputReader {
     fn drop(&mut self) {
-        // The worker may be in the middle of a DuckDB call.  Letting the process
-        // tear down the library underneath it segfaults, so ask it to stop and
-        // wait — bounded, because a wedged worker must not hang shutdown.
+        // The worker may be in the middle of a DuckDB call, so ask it to stop and
+        // wait — bounded, because a wedged worker must not hang shutdown.  The bound
+        // is safe: `Library` lives in a process-wide `OnceLock` and is never
+        // unloaded (`ffi.rs`), so a worker that outlives this `Drop` keeps a valid
+        // handle rather than a freed one.
         let _ = self.sender.send(InputReaderCommand::Disconnect);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !self.finished.load(Ordering::Acquire) {
@@ -211,10 +228,13 @@ pub fn open(
                 state,
                 poll_interval,
             );
-            worker_finished.store(true, Ordering::Release);
+            // Report before publishing the closure: `is_closed` is what makes the
+            // controller substitute a generic "closed before completing replay", and
+            // it must not win the race against the real catalog error.
             if let Err(error) = result {
                 consumer.error(true, error, None);
             }
+            worker_finished.store(true, Ordering::Release);
         })
         .context("spawning the DuckLake reader")?;
 
@@ -282,6 +302,11 @@ impl Table {
 
     /// The rows that changed in snapshots `after ..= up_to`, each preceded by its
     /// change type.
+    ///
+    /// Both bounds are inclusive — measured, not assumed: a window `(4, 5)` returns
+    /// the rows of snapshots 4 and 5.  That is why the caller passes
+    /// `state.snapshot + 1` as the lower bound, and why the three places that
+    /// describe the window have to agree on it.
     fn changes(&self, conn: &Conn<'_>, after: u64, up_to: u64) -> AnyResult<Rows> {
         let sql = format!(
             "SELECT change_type, to_json({})::VARCHAR FROM ducklake_table_changes({}, {}, {}, {after}, {up_to})",
@@ -292,7 +317,7 @@ impl Table {
         );
         conn.query(&sql, &[]).with_context(|| {
             format!(
-                "reading the changes to {}.{} in snapshots ({after}, {up_to}]",
+                "reading the changes to {}.{} in snapshots {after}..={up_to}",
                 self.schema, self.table
             )
         })
@@ -380,7 +405,16 @@ impl<'a> ReaderCatalog<'a> {
     /// This must run outside a transaction: DuckDB refuses `ATTACH` inside one.
     fn refresh(&self) -> AnyResult<()> {
         let alias = quote_ident(&self.catalog.alias)?;
-        let _ = self.conn.execute(&format!("DETACH {alias}"), &[]);
+        // Only "nothing is attached under that name" is ignorable: any other
+        // failure leaves the alias attached and turns the ATTACH below into
+        // "database with name ... already attached", which names the symptom rather
+        // than the cause.
+        if let Err(e) = self.conn.execute(&format!("DETACH {alias}"), &[]) {
+            let message = format!("{e:#}");
+            if !message.contains("not attached") && !message.contains("does not exist") {
+                return Err(e).with_context(|| format!("detaching catalog {alias}"));
+            }
+        }
         self.conn
             .execute(&attach_statement(&self.catalog, true)?, &[])
             .with_context(|| format!("re-attaching catalog {:?}", self.catalog.catalog))
@@ -430,35 +464,44 @@ pub(super) fn advance(
     table: &Table,
     sink: &mut dyn FnMut(&str, &str) -> AnyResult<()>,
     state: ReaderState,
-) -> AnyResult<ReaderState> {
+) -> AnyResult<(ReaderState, usize)> {
     catalog.refresh()?;
     catalog.transaction(|catalog| {
         let current = catalog.current_snapshot()?;
         if !state.bootstrapped {
-            for row in table.snapshot_rows(&catalog.conn)?.into_rows() {
+            let rows = table.snapshot_rows(&catalog.conn)?.into_rows();
+            let pushed = rows.len();
+            for row in rows {
                 push(sink, table, "insert", json_of(&row)?)?;
             }
-            return Ok(ReaderState {
-                snapshot: current,
-                bootstrapped: true,
-            });
+            return Ok((
+                ReaderState {
+                    snapshot: current,
+                    bootstrapped: true,
+                },
+                pushed,
+            ));
         }
         if current <= state.snapshot {
-            return Ok(state);
+            return Ok((state, 0));
         }
-        for row in table
+        let rows = table
             .changes(&catalog.conn, state.snapshot + 1, current)?
-            .into_rows()
-        {
+            .into_rows();
+        let pushed = rows.len();
+        for row in rows {
             let [Some(change_type), Some(json)] = row.as_slice() else {
                 bail!("a change row is missing its change type or payload: {row:?}");
             };
             push(sink, table, change_type, json)?;
         }
-        Ok(ReaderState {
-            snapshot: current,
-            ..state
-        })
+        Ok((
+            ReaderState {
+                snapshot: current,
+                ..state
+            },
+            pushed,
+        ))
     })
 }
 
@@ -481,16 +524,27 @@ fn run(
     poll_interval: Duration,
 ) -> AnyResult<()> {
     let mut catalog = ReaderCatalog::attach(&table.catalog)?;
+    // A command that arrives while the loop is parked is handled at the top of the
+    // next turn rather than dropped.
+    let mut pending: Option<InputReaderCommand> = None;
     loop {
         loop {
-            match receiver.try_recv() {
+            let command = match pending.take() {
+                Some(command) => command,
+                None => match receiver.try_recv() {
+                    Ok(command) => command,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                },
+            };
+            match command {
                 // `Extend` and `Pause` do not gate the poll: the controller
                 // sends `Extend` only when it already expects data, so honouring
                 // it as a poll switch would stop the poll for good after the
                 // first step.  Nothing is handed over except in answer to
                 // `Queue`, which is where `Pause` takes effect.
-                Ok(InputReaderCommand::Extend | InputReaderCommand::Pause) => {}
-                Ok(InputReaderCommand::Queue { .. }) => {
+                InputReaderCommand::Extend | InputReaderCommand::Pause => {}
+                InputReaderCommand::Queue { .. } => {
                     // Always answer the `Queue`, even with nothing buffered: the
                     // controller's step waits for this signal, so staying silent
                     // when the catalog had no news deadlocks the pipeline.  The
@@ -502,7 +556,7 @@ fn run(
                     let resume = Resume::new_metadata_only(state.to_metadata(), None);
                     consumer.extended(amt, Some(resume), vec![]);
                 }
-                Ok(InputReaderCommand::Replay { metadata, .. }) => {
+                InputReaderCommand::Replay { metadata, .. } => {
                     // The controller replays from a checkpoint: drop whatever is
                     // buffered, then re-read from the recorded snapshot.
                     stream.truncate(0);
@@ -514,9 +568,7 @@ fn run(
                     catalog = ReaderCatalog::attach(&table.catalog)?;
                     consumer.replayed(BufferSize::empty(), 0);
                 }
-                Ok(InputReaderCommand::Disconnect) => return Ok(()),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
+                InputReaderCommand::Disconnect => return Ok(()),
             }
         }
 
@@ -525,25 +577,57 @@ fn run(
         // poll for good after the first step and the connector would never see
         // another commit.  `Pause` is honoured where it matters — nothing is
         // handed to the controller except in answer to `Queue`.
-        if stream.len().is_empty() {
+        //
+        // The buffer is bounded on purpose: `Pause` stops the `Queue`s, so a
+        // suspended pipeline would otherwise accumulate every change the catalog
+        // commits for as long as it is suspended.  Nothing is lost by waiting —
+        // `state` only advances for rows actually pushed, so the next poll after a
+        // `Queue` drains the buffer reads the rest.
+        if stream.len().records < MAX_BUFFERED {
             let mut sink = |change_type: &str, json: &str| match change_type {
                 "insert" | "update_postimage" => stream.insert(json.as_bytes(), &None),
                 _ => stream.delete(json.as_bytes(), &None),
             };
-            let next = advance(&catalog, &table, &mut sink, state)?;
+            let (next, pushed) = advance(&catalog, &table, &mut sink, state)?;
             if next != state {
                 state = next;
-                // Nothing else tells the controller that the catalog had news:
-                // without this the pipeline parks with the rows still buffered
-                // in the stream.  The `clock` connector asks for steps the same
-                // way, on every tick that produces something.
-                consumer.request_step();
+                // Only when rows were pushed: the snapshot counter is
+                // catalog-global, so another table's commit moves it too, and
+                // asking for a step for it would produce an empty step per foreign
+                // commit — a step storm with a transaction and a checkpoint each.
+                if pushed > 0 {
+                    consumer.request_step();
+                }
             }
         }
-        thread::sleep(if stream.len().is_empty() {
+
+        // Park until the controller says something, and wake *for* it: a step or a
+        // checkpoint that arrives just after the park would otherwise wait out the
+        // whole poll interval, which bounds an idle pipeline to one step per poll
+        // interval and delays every checkpoint by the same amount.
+        let wait = if stream.len().is_empty() {
             poll_interval
         } else {
             FLUSH_INTERVAL
-        });
+        };
+        // `tokio`'s unbounded receiver has no timed receive on a blocking thread,
+        // so the wait is sliced: a command is picked up within one slice, which is
+        // what bounds step latency to a couple of milliseconds instead of a whole
+        // poll interval.
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match receiver.try_recv() {
+                Ok(command) => {
+                    pending = Some(command);
+                    break;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(HANDOFF_SLICE);
+        }
     }
 }

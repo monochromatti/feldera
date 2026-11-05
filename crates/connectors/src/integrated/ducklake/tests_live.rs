@@ -466,7 +466,9 @@ fn advance_once(
             pushed.push((change_type.to_owned(), json.to_owned()));
             Ok(())
         };
-        advance(&catalog, &table, &mut sink, state).expect("one read attempt")
+        let (next, _pushed) =
+            advance(&catalog, &table, &mut sink, state).expect("one read attempt");
+        next
     };
     (pushed, next)
 }
