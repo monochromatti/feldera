@@ -106,7 +106,11 @@ fn publishing_the_same_batch_twice_applies_it_once() {
     let again = catalog.publish(&batch, 8).expect("republication");
     assert_eq!(again.decision, Decision::Duplicate);
 
-    assert_eq!(catalog.frontier(), 1, "the frontier is the batch's end");
+    assert_eq!(
+        catalog.frontier().expect("read the frontier"),
+        1,
+        "the frontier is the batch's end"
+    );
     assert_eq!(
         catalog
             .scalar("SELECT count(*) FROM dl.orders")
@@ -133,7 +137,7 @@ fn the_frontier_survives_reopening_the_catalog() {
     }
 
     let mut catalog = Catalog::open(&config).expect("reattach the catalog");
-    assert_eq!(catalog.frontier(), 1);
+    assert_eq!(catalog.frontier().expect("read the frontier"), 1);
 
     // The same batch, recognised after a restart as already applied.
     let replay = batch(&catalog);
@@ -209,7 +213,7 @@ fn a_payload_failure_leaves_the_guard_and_the_history_where_they_were() {
     );
 
     assert_eq!(
-        catalog.frontier(),
+        catalog.frontier().expect("read the frontier"),
         1,
         "the guard moved for a failed payload"
     );
@@ -267,7 +271,7 @@ fn a_divergent_payload_for_a_committed_identity_is_refused() {
         ["1|a", "2|b"],
         "the refused payload was applied anyway"
     );
-    assert_eq!(catalog.frontier(), 1);
+    assert_eq!(catalog.frontier().expect("read the frontier"), 1);
 }
 
 /// A resync replaces the whole content, and replaying it is still a duplicate.
@@ -403,17 +407,23 @@ fn a_multiset_delete_removes_one_copy() {
     );
 }
 
-/// `extension_directory` is applied with DuckDB's current setting, not the
-/// deprecated one.
+/// The extension is loaded from the configured directory, not from the default
+/// one and not from the network.
 ///
-/// DuckDB 2.0 deprecated `extension_directory` in favour of
-/// `extension_directories`, which is a list and refuses a bare path: writing the
-/// bare path returns a config error that `duckdb_open_ext` ignores, after which
-/// extensions come from the default directory or the network.  The failure this
-/// test prevents is exactly that silent misconfiguration — a deployment that
-/// vendored an extension and still does not find it.
+/// This is the property an offline deployment needs, and it is asserted through
+/// `duckdb_extensions().install_path` rather than through a setting value,
+/// because the setting is not observable: writing the deprecated
+/// `extension_directory` through `duckdb_create_config` is accepted and honoured
+/// but `current_setting('extension_directory')` reports an empty string, and the
+/// same is true of `extension_directories`.  A test that asserted on the setting
+/// name would pass for the wrong reason or fail for none — so this asserts where
+/// the loaded binary came from.
+///
+/// Move `~/.duckdb/extensions` aside and run this suite to see the difference: the
+/// other live tests still pass, which is what proves the directory is consulted at
+/// all rather than the home directory silently serving the extension.
 #[test]
-fn the_extension_directory_is_applied_as_the_current_setting() {
+fn the_extension_is_loaded_from_the_configured_directory() {
     let Some(config) = live_config("extension-directories") else {
         return;
     };
@@ -424,22 +434,17 @@ fn the_extension_directory_is_applied_as_the_current_setting() {
         .expect("the test config sets one");
 
     let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
-    let applied = catalog
-        .scalar("SELECT current_setting('extension_directories')")
-        .expect("read the setting")
-        .expect("a value");
+    let path = catalog
+        .scalar(
+            "SELECT install_path FROM duckdb_extensions() \
+             WHERE extension_name = 'ducklake' AND loaded",
+        )
+        .expect("read the loaded extension")
+        .expect("ducklake is loaded");
     assert!(
-        applied.contains(&expected),
-        "the directory {expected:?} was not applied through extension_directories; the \
-         deprecated singular setting was used instead ({applied})"
-    );
-    // And the extension it points at actually loaded, so the setting was not just
-    // recorded in a table.
-    assert_eq!(
-        catalog
-            .scalar("SELECT count(*) FROM duckdb_extensions() WHERE extension_name = 'ducklake' AND loaded")
-            .expect("read the loaded extensions"),
-        Some("1".to_owned())
+        path.starts_with(&expected),
+        "the ducklake extension was loaded from {path:?}, not from the configured \
+         directory {expected:?}"
     );
 }
 

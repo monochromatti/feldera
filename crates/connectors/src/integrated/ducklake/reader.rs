@@ -257,9 +257,13 @@ impl Table {
     }
 
     fn qualified_name(&self) -> String {
+        // The alias is quoted like the rest: `ATTACH ... AS <alias>` created it with
+        // `quote_ident`, so an alias needing quotes (a dot, a dash, mixed case) has
+        // to be referred to the same way.  Unquoted, `my.alias.db.tbl` silently
+        // addresses a different catalog.
         format!(
             "{}.{}.{}",
-            self.alias,
+            quote_ident(&self.alias).unwrap_or_else(|_| self.alias.clone()),
             quote_ident(&self.schema).unwrap_or_else(|_| self.schema.clone()),
             quote_ident(&self.table).unwrap_or_else(|_| self.table.clone())
         )
@@ -339,9 +343,9 @@ impl<'a> ReaderCatalog<'a> {
         let library = Library::load()?;
         let config = library.config()?;
         if let Some(dir) = &catalog.extension_directory {
-            library.set_extension_directory(config, dir)?;
+            library.set_extension_directory(*config, dir)?;
         }
-        let db = Db::open(library, ":memory:", config)
+        let db = Db::open(library, ":memory:", *config)
             .with_context(|| format!("opening DuckDB for catalog {:?}", catalog.catalog))?;
         let conn = db.connect()?;
 

@@ -197,7 +197,7 @@ impl DuckLakeWriter {
             "ducklake: {} attached {:?} at frontier {} epoch {}",
             self.endpoint_name,
             self.config.catalog.catalog,
-            catalog.frontier(),
+            catalog.frontier().unwrap_or_default(),
             catalog.epoch()
         );
         self.catalog = Some(catalog);
@@ -217,18 +217,16 @@ impl DuckLakeWriter {
             // happens when a step's rows cancelled out exactly.
             return;
         }
-        let result = self.publish(step, deltas, resync);
-        match result {
-            Ok(()) => {
-                if let Some(catalog) = &self.catalog {
-                    self.report_progress(catalog.frontier());
-                }
-            }
+        match self.publish(step, deltas, resync) {
+            // Report the frontier of the guard row this publication wrote, not a
+            // fresh read: a read that fails must not turn into "frontier 0".
+            Ok(frontier) => self.report_progress(frontier),
             Err(e) => self.fail_and_hold(e),
         }
     }
 
-    fn publish(&mut self, step: Step, deltas: Vec<Delta>, resync: bool) -> AnyResult<()> {
+    /// Publish one step and return the frontier the guard row now carries.
+    fn publish(&mut self, step: Step, deltas: Vec<Delta>, resync: bool) -> AnyResult<u64> {
         self.ensure_connected()?;
         let catalog = self
             .catalog
@@ -242,7 +240,9 @@ impl DuckLakeWriter {
         // The base is the frontier the batch was assembled against.  Taking it
         // from the guard rather than from the previous step means a step the
         // engine skipped (one with no output) is not mistaken for a gap.
-        let base = catalog.frontier();
+        // A guard row that cannot be read must stop the publication: defaulting to
+        // frontier 0 would make every batch look like a duplicate of the first one.
+        let base = catalog.frontier()?;
         let batch = Batch {
             output_group: self.config.output_group.clone(),
             generation: self.config.generation.clone(),
@@ -263,7 +263,7 @@ impl DuckLakeWriter {
                     batch.deltas.len(),
                     result.attempts
                 );
-                Ok(())
+                Ok(result.guard.frontier)
             }
             protocol::Decision::Duplicate => {
                 tracing::info!(
@@ -271,7 +271,7 @@ impl DuckLakeWriter {
                     self.endpoint_name,
                     batch.batch_id()
                 );
-                Ok(())
+                Ok(result.guard.frontier)
             }
             other => bail!(
                 "ducklake: {} refused {}: {} (frontier {})",

@@ -73,10 +73,13 @@ pub fn quote_ident(ident: &str) -> Result<String> {
 pub struct Catalog {
     #[allow(dead_code)] // the library stays loaded for the catalog's lifetime
     lib: &'static Library,
-    /// Owns the DuckDB database handle.  Never read after `open`, but dropping it
-    /// would close the database that `conn` belongs to.
+    /// Owns the DuckDB database handle.  Never read after `open`.  Declared
+    /// **after** `conn` on purpose: fields are dropped in declaration order, and
+    /// `duckdb_close` requires every connection to be closed first — with this
+    /// last, `duckdb_disconnect` runs before the database is closed.
     #[allow(dead_code)]
     db: Db<'static>,
+    conn: Conn<'static>,
     alias: String,
     schema: String,
     guard_table: String,
@@ -87,7 +90,6 @@ pub struct Catalog {
     keys: BTreeMap<String, Vec<String>>,
     /// Tables this connector owns; a batch writing anything else is rejected.
     tables: Vec<String>,
-    conn: Conn<'static>,
 }
 
 impl Catalog {
@@ -102,9 +104,9 @@ impl Catalog {
         let cdc = &config.catalog;
         let db_config = lib.config()?;
         if let Some(dir) = &cdc.extension_directory {
-            lib.set_extension_directory(db_config, dir)?;
+            lib.set_extension_directory(*db_config, dir)?;
         }
-        let db = Db::open(lib, ":memory:", db_config).with_context(|| {
+        let db = Db::open(lib, ":memory:", *db_config).with_context(|| {
             format!(
                 "opening the DuckDB connection for catalog {:?}",
                 cdc.catalog
@@ -155,8 +157,13 @@ impl Catalog {
         Ok(catalog)
     }
 
-    pub fn frontier(&self) -> u64 {
-        self.read_guard().map(|g| g.frontier).unwrap_or(0)
+    /// The frontier in the guard row.
+    ///
+    /// This used to default to 0 when the read failed, which turns a broken
+    /// connection into "this output group has published nothing" — the writer would
+    /// then base every batch on 0 and the protocol would call them duplicates.
+    pub fn frontier(&self) -> Result<u64> {
+        Ok(self.read_guard()?.frontier)
     }
 
     pub fn epoch(&self) -> u64 {
@@ -310,7 +317,10 @@ impl Catalog {
                 self.output_group
             );
         }
-        self.conn.execute("COMMIT", &[])?;
+        if let Err(e) = self.conn.execute("COMMIT", &[]) {
+            let _ = self.conn.execute("ROLLBACK", &[]);
+            return Err(e);
+        }
         Ok(current)
     }
 
@@ -327,9 +337,25 @@ impl Catalog {
                 return Err(e);
             }
             let outcome = self.attempt(batch);
-            match outcome {
-                Ok(result) => {
-                    self.conn.execute("COMMIT", &[])?;
+            let result = match outcome {
+                Ok(result) => result,
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    let _ = self.conn.execute("ROLLBACK", &[]);
+                    if !is_transaction_conflict(&message) || attempt >= max_attempts.max(1) {
+                        return Err(e);
+                    }
+                    conflict = Some(message);
+                    continue;
+                }
+            };
+            // `COMMIT` is part of the attempt, not a formality after it.  DuckLake
+            // detects a write-write race at commit — that is what an optimistic
+            // catalog commit is — so retrying only the statements before it would
+            // turn the most likely conflict into a hard error, which the caller
+            // cannot distinguish from a real failure.
+            match self.conn.execute("COMMIT", &[]) {
+                Ok(()) => {
                     return Ok(PublicationResult {
                         guard: protocol::advance(&result.guard, batch),
                         decision: result.decision,
@@ -338,8 +364,11 @@ impl Catalog {
                 }
                 Err(e) => {
                     let message = format!("{e:#}");
+                    // A failed `COMMIT` may leave the transaction open; without this
+                    // the next `BEGIN` is a no-op inside it and later statements
+                    // pile into one transaction that a later `ROLLBACK` discards.
                     let _ = self.conn.execute("ROLLBACK", &[]);
-                    if !is_transaction_conflict(&message) || attempt == max_attempts {
+                    if !is_transaction_conflict(&message) || attempt >= max_attempts.max(1) {
                         return Err(e);
                     }
                     conflict = Some(message);

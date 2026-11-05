@@ -50,6 +50,7 @@ unsafe impl Send for Config {}
 struct Fns {
     create_config: unsafe extern "C" fn(*mut Config) -> State,
     set_config: unsafe extern "C" fn(Config, *const c_char, *const c_char) -> State,
+    destroy_config: unsafe extern "C" fn(*mut Config),
     open_ext: unsafe extern "C" fn(*const c_char, *mut Database, Config, *mut *mut c_char) -> State,
     connect: unsafe extern "C" fn(Database, *mut Connection) -> State,
     close: unsafe extern "C" fn(*mut Database),
@@ -93,6 +94,34 @@ pub struct Connection {
 #[derive(Copy, Clone)]
 pub struct Config {
     ptr: *mut c_void,
+}
+
+/// The owner of a `duckdb_config`: a `Config` is a copyable handle, this type
+/// destroys it.
+///
+/// DuckDB's contract is that the caller destroys the config it created, *after*
+/// using it to open (or not) — not that `duckdb_open_ext` consumes it.  The
+/// handle was leaked on every connector instantiation, including on the error
+/// paths that never reach `open_ext`.
+pub struct Owned<'a> {
+    lib: &'a Library,
+    config: Config,
+}
+
+impl std::ops::Deref for Owned<'_> {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        &self.config
+    }
+}
+
+impl Drop for Owned<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `duckdb_create_config`, this is the only
+        // `Drop` for it, and the library outlives the config (borrowed).
+        unsafe { (self.lib.fns.destroy_config)(&mut self.config) };
+    }
 }
 
 #[repr(C)]
@@ -144,7 +173,8 @@ impl Library {
         for candidate in &candidates {
             let cpath = CString::new(candidate.as_str())?;
             // SAFETY: the path is a valid C string and the flags are constant.
-            let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_LAZY | RTLD_LOCAL) };
+            let handle =
+                unsafe { dlopen(cpath.as_ptr(), dlflags::RTLD_LAZY | dlflags::RTLD_LOCAL) };
             if handle.is_null() {
                 last_err = Some(format!("{candidate}: {}", dlerror_message()));
                 continue;
@@ -178,13 +208,14 @@ impl Library {
             .into_owned()
     }
 
-    pub fn config(&self) -> Result<Config> {
+    /// A fresh config, destroyed when the returned owner is dropped.
+    pub fn config(&self) -> Result<Owned<'_>> {
         let mut config = Config {
             ptr: ptr::null_mut(),
         };
         // SAFETY: `config` is a valid out-pointer.
         check(unsafe { (self.fns.create_config)(&mut config) })?;
-        Ok(config)
+        Ok(Owned { lib: self, config })
     }
 
     pub fn set_config(&self, config: Config, name: &str, value: &str) -> Result<()> {
@@ -211,17 +242,17 @@ impl Library {
     pub fn set_extension_directory(&self, config: Config, directory: &str) -> Result<()> {
         // Quoted, so a comma or a space in the path is not read as a separator.
         let list = format!("['{}']", directory.replace('\'', "''"));
-        if self
-            .set_config(config, "extension_directories", &list)
-            .is_ok()
-        {
-            return Ok(());
-        }
+        // Keep the first failure: if both keys are refused, the reason the current
+        // one was refused is the diagnostic, not the fact that there were two.
+        let list_error = match self.set_config(config, "extension_directories", &list) {
+            Ok(()) => return Ok(()),
+            Err(e) => format!("{e:#}"),
+        };
         self.set_config(config, "extension_directory", directory)
             .with_context(|| {
                 format!(
-                    "setting neither extension_directories nor extension_directory to \
-                     {directory:?}"
+                    "setting neither extension_directories ({list_error}) nor \
+                     extension_directory to {directory:?}"
                 )
             })
     }
@@ -232,8 +263,8 @@ impl Library {
             internal_ptr: ptr::null_mut(),
         };
         let mut err: *mut c_char = ptr::null_mut();
-        // SAFETY: `db` and `err` are valid out-pointers; `config` is consumed by
-        // this call, which is why `Config` is not used afterwards.
+        // SAFETY: `db` and `err` are valid out-pointers; DuckDB copies the config
+        // during the call, and the caller destroys it afterwards (`Owned`).
         let state = unsafe { (self.fns.open_ext)(path.as_ptr(), &mut db, config, &mut err) };
         if state != SUCCESS {
             let message = take_c_string(self, err);
@@ -276,10 +307,17 @@ impl Library {
         // SAFETY: `stmt` is a valid out-pointer.
         let state = unsafe { (self.fns.prepare)(conn, sql_c.as_ptr(), &mut stmt) };
         if state != SUCCESS {
-            // SAFETY: a failed prepare leaves `stmt` usable for the error text.
-            let message = unsafe { CStr::from_ptr((self.fns.prepare_error)(stmt)) }
-                .to_string_lossy()
-                .into_owned();
+            // SAFETY: a failed prepare leaves `stmt` usable for the error text,
+            // but the text itself may be absent — reading a null pointer here
+            // would be a straight dereference of address 0.
+            let text = unsafe { (self.fns.prepare_error)(stmt) };
+            let message = if text.is_null() {
+                "no error text".to_owned()
+            } else {
+                unsafe { CStr::from_ptr(text) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
             // SAFETY: the statement is not executed and is destroyed once.
             unsafe { (self.fns.destroy_prepare)(&mut stmt) };
             bail!("preparing {sql:?} failed: {message}");
@@ -298,7 +336,9 @@ impl Library {
                     Value::Int(i) => (self.fns.bind_int64)(stmt, idx, *i),
                     Value::Float(f) => (self.fns.bind_double)(stmt, idx, *f),
                     Value::Text(s) => {
-                        let cs = CString::new(s.as_str())?;
+                        let cs = CString::new(s.as_str()).with_context(|| {
+                            format!("parameter {idx} of {sql:?} contains a NUL byte")
+                        })?;
                         (self.fns.bind_varchar)(stmt, idx, cs.as_ptr())
                     }
                 }
@@ -395,10 +435,22 @@ fn dlerror_message() -> String {
     }
 }
 
-#[cfg(unix)]
-const RTLD_LAZY: i32 = 0x1;
-#[cfg(unix)]
-const RTLD_LOCAL: i32 = 0x4;
+/// `dlopen` flags, which are **not** the same on every platform: `RTLD_LOCAL`
+/// is `0x4` on macOS but `0` on glibc and musl, where `0x4` is `RTLD_NOLOAD`
+/// ("only if already resident").  A single hardcoded `0x4` therefore made every
+/// `dlopen` of a not-yet-loaded libduckdb fail on Linux with a message that
+/// blamed the path, so the flags are per-platform.  `libc` would supply them,
+/// but it would be a dependency for two integers.
+#[cfg(target_os = "macos")]
+mod dlflags {
+    pub const RTLD_LAZY: i32 = 0x1;
+    pub const RTLD_LOCAL: i32 = 0x4;
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+mod dlflags {
+    pub const RTLD_LAZY: i32 = 0x1;
+    pub const RTLD_LOCAL: i32 = 0x0;
+}
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
@@ -429,6 +481,7 @@ impl Fns {
         Ok(Fns {
             create_config: sym!("duckdb_create_config": unsafe extern "C" fn(*mut Config) -> State),
             set_config: sym!("duckdb_set_config": unsafe extern "C" fn(Config, *const c_char, *const c_char) -> State),
+            destroy_config: sym!("duckdb_destroy_config": unsafe extern "C" fn(*mut Config)),
             open_ext: sym!("duckdb_open_ext": unsafe extern "C" fn(*const c_char, *mut Database, Config, *mut *mut c_char) -> State),
             connect: sym!("duckdb_connect": unsafe extern "C" fn(Database, *mut Connection) -> State),
             close: sym!("duckdb_close": unsafe extern "C" fn(*mut Database)),

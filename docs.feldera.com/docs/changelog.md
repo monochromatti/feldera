@@ -10,6 +10,13 @@ Source edition can be found on github.
 
 ## Unreleased
 
+- New DuckLake source and sink connectors: a pipeline can read a DuckLake table
+  as input and write one as output, against a DuckDB metadata catalog that lives
+  in a file or in PostgreSQL. The sink publishes each step atomically with a
+  guard row, so a retried publication is recognised as a duplicate instead of
+  being applied twice. DuckDB and the DuckLake extension are loaded at runtime
+  from an installation on the host, so no extra build dependency is added.
+
 ## v0.373.0
 
 - With `FELDERA_REFUSE_LOCAL_FILE_URIS=true`, Delta Lake and Iceberg connectors

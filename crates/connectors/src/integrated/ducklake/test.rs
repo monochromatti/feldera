@@ -231,7 +231,7 @@ pub fn ducklake_output_publishes_the_step_it_committed(engine: &dyn PipelineTest
     // suite must not predict it.  What is this suite's business is that a step
     // was recorded at all, together with the rows themselves: the exact
     // bookkeeping is covered by the protocol tests, which control the step.
-    let frontier = catalog.frontier();
+    let frontier = catalog.frontier().expect("read the frontier");
     assert!(
         frontier >= 1,
         "the guard row records the step that published: {frontier}"
@@ -443,9 +443,8 @@ pub fn ducklake_to_ducklake_copies_a_table_into_another(engine: &dyn PipelineTes
         "the sink table holds what the source table held"
     );
     assert!(
-        verify.frontier() >= 1,
-        "the sink recorded the step it published: {}",
-        verify.frontier()
+        verify.frontier().expect("read the frontier") >= 1,
+        "the sink recorded the step it published"
     );
     controller.stop().expect("stop the controller");
 }
