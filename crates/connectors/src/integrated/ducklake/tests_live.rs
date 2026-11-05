@@ -403,6 +403,46 @@ fn a_multiset_delete_removes_one_copy() {
     );
 }
 
+/// `extension_directory` is applied with DuckDB's current setting, not the
+/// deprecated one.
+///
+/// DuckDB 2.0 deprecated `extension_directory` in favour of
+/// `extension_directories`, which is a list and refuses a bare path: writing the
+/// bare path returns a config error that `duckdb_open_ext` ignores, after which
+/// extensions come from the default directory or the network.  The failure this
+/// test prevents is exactly that silent misconfiguration — a deployment that
+/// vendored an extension and still does not find it.
+#[test]
+fn the_extension_directory_is_applied_as_the_current_setting() {
+    let Some(config) = live_config("extension-directories") else {
+        return;
+    };
+    let expected = config
+        .catalog
+        .extension_directory
+        .clone()
+        .expect("the test config sets one");
+
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    let applied = catalog
+        .scalar("SELECT current_setting('extension_directories')")
+        .expect("read the setting")
+        .expect("a value");
+    assert!(
+        applied.contains(&expected),
+        "the directory {expected:?} was not applied through extension_directories; the \
+         deprecated singular setting was used instead ({applied})"
+    );
+    // And the extension it points at actually loaded, so the setting was not just
+    // recorded in a table.
+    assert_eq!(
+        catalog
+            .scalar("SELECT count(*) FROM duckdb_extensions() WHERE extension_name = 'ducklake' AND loaded")
+            .expect("read the loaded extensions"),
+        Some("1".to_owned())
+    );
+}
+
 /// The projection the reader builds from a relation, for the two-column test
 /// table.  Spelled out here so the test fails if the reader's projection stops
 /// matching what `to_json` needs.

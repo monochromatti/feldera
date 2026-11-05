@@ -102,7 +102,7 @@ impl Catalog {
         let cdc = &config.catalog;
         let db_config = lib.config()?;
         if let Some(dir) = &cdc.extension_directory {
-            lib.set_config(db_config, "extension_directory", dir)?;
+            lib.set_extension_directory(db_config, dir)?;
         }
         let db = Db::open(lib, ":memory:", db_config).with_context(|| {
             format!(

@@ -132,3 +132,8 @@ it at run time — a host without egress would otherwise fail on the first attac
 download would make a production deployment depend on the extension registry being up.
 `extension_directory` points at the vendored copy; the extension is signature-checked
 against DuckDB's built-in keys, so the official build loads without weakening that check.
+
+The connector applies this as DuckDB's `extension_directories` setting (a list), falling back
+to the deprecated `extension_directory` on a DuckDB that does not have it. DuckDB 2.0 still
+accepts the old setting but says it "will be removed in a future release", so a log line
+about it means the fallback was used.

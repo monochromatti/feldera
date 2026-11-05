@@ -240,6 +240,7 @@ impl Table {
     /// A table address, with the JSON projection given by the caller.  The
     /// projection normally comes from the relation ([`projection`]); a test that
     /// has no relation passes the one it wants to read.
+    #[cfg(test)]
     pub(super) fn new(
         catalog: &DuckLakeCatalogConfig,
         schema: &str,
@@ -338,7 +339,7 @@ impl<'a> ReaderCatalog<'a> {
         let library = Library::load()?;
         let config = library.config()?;
         if let Some(dir) = &catalog.extension_directory {
-            library.set_config(config, "extension_directory", dir)?;
+            library.set_extension_directory(config, dir)?;
         }
         let db = Db::open(library, ":memory:", config)
             .with_context(|| format!("opening DuckDB for catalog {:?}", catalog.catalog))?;

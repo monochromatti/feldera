@@ -195,6 +195,37 @@ impl Library {
             .with_context(|| format!("setting DuckDB option {name:?}"))
     }
 
+    /// Point DuckDB at the directory to find (and install) extensions in.
+    ///
+    /// DuckDB 2.0 deprecated `extension_directory` in favour of
+    /// `extension_directories`, which is a *list*: the singular key still works
+    /// but warns, and is gone from `duckdb_settings()` altogether, so it will be
+    /// removed.  Both take a string through the C API, but the list setting
+    /// refuses a bare path — measured: `duckdb_set_config(config,
+    /// "extension_directories", "/some/dir")` returns an error, the open then
+    /// proceeds *without* the setting, and `LOAD ducklake` goes to the default
+    /// directory or the network.  A silent misconfiguration is the worst outcome
+    /// for an offline deployment, so the list form is written here once and the
+    /// deprecated key is only a fallback: no version sniffing, and a DuckDB that
+    /// drops the old key still gets the right directory.
+    pub fn set_extension_directory(&self, config: Config, directory: &str) -> Result<()> {
+        // Quoted, so a comma or a space in the path is not read as a separator.
+        let list = format!("['{}']", directory.replace('\'', "''"));
+        if self
+            .set_config(config, "extension_directories", &list)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.set_config(config, "extension_directory", directory)
+            .with_context(|| {
+                format!(
+                    "setting neither extension_directories nor extension_directory to \
+                     {directory:?}"
+                )
+            })
+    }
+
     pub fn open(&self, path: &str, config: Config) -> Result<Database> {
         let path = CString::new(path)?;
         let mut db = Database {

@@ -198,6 +198,24 @@ pub fn ducklake_output_publishes_the_step_it_committed(engine: &dyn PipelineTest
         "the connector failed: {:?}",
         error_receiver.try_iter().collect::<Vec<_>>()
     );
+    // Read the published state while the pipeline is still running, then stop it.
+    // Two things make a naive read wrong.  Processing and publishing are different
+    // events — the circuit emits, the writer commits afterwards on its own thread —
+    // so the read must poll.  And a DuckLake attachment only sees the snapshot it
+    // attached with: a commit made by another attachment is invisible to it, so a
+    // poll has to re-attach each time (measured: a table created by a second
+    // attachment does not even appear in a long-lived one).  Polling after
+    // `stop()` would test shutdown instead of the protocol, so the controller
+    // stays alive until the rows are there.
+    wait(
+        || {
+            Catalog::open(&writer(&dir, "orders"))
+                .and_then(|mut catalog| catalog.scalar("SELECT count(*) FROM dl.main.orders"))
+                .is_ok_and(|count| count.as_deref() == Some("2"))
+        },
+        60_000,
+    )
+    .expect("the writer to publish the step");
     controller.stop().expect("stop the controller");
 
     let mut catalog = Catalog::open(&writer(&dir, "orders")).expect("reattach the catalog");
@@ -400,8 +418,21 @@ pub fn ducklake_to_ducklake_copies_a_table_into_another(engine: &dyn PipelineTes
         "the connector failed: {:?}",
         error_receiver.try_iter().collect::<Vec<_>>()
     );
-    controller.stop().expect("stop the controller");
-
+    // Poll a *fresh* attachment: a DuckLake attachment only sees the snapshot it
+    // attached with, so re-attaching is what lets one attachment observe another's
+    // commit.  The controller stays alive until the rows are there — reading after
+    // `stop()` would test shutdown rather than the protocol.
+    wait(
+        || {
+            Catalog::open(&writer(&sink_dir, "orders_out"))
+                .and_then(|mut catalog| {
+                    catalog.rows("SELECT id, b, i, s FROM dl.main.orders_out ORDER BY id")
+                })
+                .is_ok_and(|rows| rows.len() == 2)
+        },
+        60_000,
+    )
+    .expect("the sink to publish the step");
     let mut verify =
         Catalog::open(&writer(&sink_dir, "orders_out")).expect("reattach the sink catalog");
     assert_eq!(
@@ -416,6 +447,7 @@ pub fn ducklake_to_ducklake_copies_a_table_into_another(engine: &dyn PipelineTes
         "the sink recorded the step it published: {}",
         verify.frontier()
     );
+    controller.stop().expect("stop the controller");
 }
 
 /// A commit made by another *process* arrives in the pipeline.
@@ -517,7 +549,7 @@ pub fn ducklake_input_follows_a_commit_from_another_process(engine: &dyn Pipelin
     // The other process: a second DuckDB, with its own transaction, committing a
     // row into the same catalog while the pipeline runs.
     let script = format!(
-        "SET extension_directory = '{extensions}';\
+        "SET extension_directories = ['{extensions}'];\
          LOAD ducklake;\
          ATTACH '{dsn}' AS dl (DATA_PATH '{}');\
          INSERT INTO dl.main.orders VALUES (2, false, 20, 'b');",
