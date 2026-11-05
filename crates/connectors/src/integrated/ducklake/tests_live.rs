@@ -110,11 +110,11 @@ fn publishing_the_same_batch_twice_applies_it_once() {
         .expect("create the sink table");
 
     let batch = batch(&catalog);
-    let first = catalog.publish(&batch, 8).expect("first publication");
+    let first = catalog.publish(&batch, None, 8).expect("first publication");
     assert_eq!(first.decision, Decision::Apply);
     assert_eq!(first.attempts, 1);
 
-    let again = catalog.publish(&batch, 8).expect("republication");
+    let again = catalog.publish(&batch, None, 8).expect("republication");
     assert_eq!(again.decision, Decision::Duplicate);
 
     assert_eq!(
@@ -144,7 +144,9 @@ fn the_frontier_survives_reopening_the_catalog() {
         catalog
             .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
             .expect("create the sink table");
-        catalog.publish(&batch(&catalog), 8).expect("publication");
+        catalog
+            .publish(&batch(&catalog), None, 8)
+            .expect("publication");
     }
 
     let mut catalog = Catalog::open(&config).expect("reattach the catalog");
@@ -152,7 +154,7 @@ fn the_frontier_survives_reopening_the_catalog() {
 
     // The same batch, recognised after a restart as already applied.
     let replay = batch(&catalog);
-    let result = catalog.publish(&replay, 8).expect("replay");
+    let result = catalog.publish(&replay, None, 8).expect("replay");
     assert_eq!(result.decision, Decision::Duplicate);
     assert_eq!(
         catalog
@@ -202,7 +204,9 @@ fn a_payload_failure_leaves_the_guard_and_the_history_where_they_were() {
         .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR NOT NULL)")
         .expect("create the sink table");
     let first = batch(&catalog);
-    catalog.publish(&first, 8).expect("the first publication");
+    catalog
+        .publish(&first, None, 8)
+        .expect("the first publication");
     let committed = snapshot(&mut catalog);
 
     let bad = step(
@@ -216,7 +220,7 @@ fn a_payload_failure_leaves_the_guard_and_the_history_where_they_were() {
         )],
     );
     let error = catalog
-        .publish(&bad, 1)
+        .publish(&bad, None, 1)
         .expect_err("a NOT NULL violation must fail the publication");
     assert!(
         format!("{error:#}").contains("NOT NULL"),
@@ -258,7 +262,9 @@ fn a_divergent_payload_for_a_committed_identity_is_refused() {
         .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
         .expect("create the sink table");
     let first = batch(&catalog);
-    catalog.publish(&first, 8).expect("the first publication");
+    catalog
+        .publish(&first, None, 8)
+        .expect("the first publication");
 
     // Same identity — generation and interval — with different content.
     let mut divergent = batch(&catalog);
@@ -268,7 +274,7 @@ fn a_divergent_payload_for_a_committed_identity_is_refused() {
         json!({"id": 1, "name": "zzz"}),
     )];
     let error = catalog
-        .publish(&divergent, 1)
+        .publish(&divergent, None, 1)
         .expect_err("a divergent payload is not a duplicate");
     assert!(
         format!("{error:#}").contains("different content"),
@@ -300,7 +306,9 @@ fn a_resync_replaces_the_content_and_replays_as_a_duplicate() {
         .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
         .expect("create the sink table");
     let first = batch(&catalog);
-    catalog.publish(&first, 8).expect("the first publication");
+    catalog
+        .publish(&first, None, 8)
+        .expect("the first publication");
 
     // Row 1 disappears, row 2 is rewritten: the batch is the whole content.
     let resync = Batch {
@@ -317,7 +325,7 @@ fn a_resync_replaces_the_content_and_replays_as_a_duplicate() {
         )],
         ..batch(&catalog)
     };
-    let result = catalog.publish(&resync, 8).expect("a resync applies");
+    let result = catalog.publish(&resync, None, 8).expect("a resync applies");
     assert_eq!(result.decision, Decision::Apply);
     assert_eq!(
         catalog
@@ -327,7 +335,9 @@ fn a_resync_replaces_the_content_and_replays_as_a_duplicate() {
         "a resync must leave exactly its own content"
     );
 
-    let replay = catalog.publish(&resync, 8).expect("a replayed resync");
+    let replay = catalog
+        .publish(&resync, None, 8)
+        .expect("a replayed resync");
     assert_eq!(replay.decision, Decision::Duplicate);
     assert_eq!(
         catalog
@@ -362,7 +372,9 @@ fn a_keyed_update_leaves_the_post_image() {
             json!({"id": 1, "name": "a"}),
         )],
     );
-    catalog.publish(&first, 8).expect("the first publication");
+    catalog
+        .publish(&first, None, 8)
+        .expect("the first publication");
 
     let update = step(
         &catalog,
@@ -373,7 +385,7 @@ fn a_keyed_update_leaves_the_post_image() {
             Delta::new("orders", Op::Insert, json!({"id": 1, "name": "a2"})),
         ],
     );
-    catalog.publish(&update, 8).expect("the update");
+    catalog.publish(&update, None, 8).expect("the update");
     assert_eq!(
         catalog
             .rows("SELECT id, name FROM dl.orders ORDER BY id")
@@ -407,14 +419,16 @@ fn a_multiset_delete_removes_one_copy() {
             Delta::new("orders", Op::Insert, row.clone()),
         ],
     );
-    catalog.publish(&first, 8).expect("two copies of one row");
+    catalog
+        .publish(&first, None, 8)
+        .expect("two copies of one row");
     assert_eq!(
         catalog.rows("SELECT id, name FROM dl.orders").unwrap(),
         ["7|a", "7|a"]
     );
 
     let second = step(&catalog, 1, 2, vec![Delta::new("orders", Op::Delete, row)]);
-    catalog.publish(&second, 8).expect("a single delete");
+    catalog.publish(&second, None, 8).expect("a single delete");
     assert_eq!(
         catalog.rows("SELECT id, name FROM dl.orders").unwrap(),
         ["7|a"],

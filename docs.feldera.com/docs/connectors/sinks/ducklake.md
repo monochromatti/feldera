@@ -139,3 +139,18 @@ The connector applies this as DuckDB's `extension_directories` setting (a list),
 to the deprecated `extension_directory` on a DuckDB that does not have it. DuckDB 2.0 still
 accepts the old setting but says it "will be removed in a future release", so a log line
 about it means the fallback was used.
+
+## Known limits
+
+- **A publication failure stalls, it does not skip.** The connector reports the error and holds
+  its output thread until the pipeline is cancelled, because returning would let the engine
+  count the step as processed with its rows missing from the catalog. There is no repair
+  endpoint: fix the cause (credentials, permissions, the guard row) and restart.
+- **An empty snapshot is never delivered.** The engine does not call the encoder for a snapshot
+  batch with no rows, so a pipeline restarted against a non-empty table keeps the previous rows
+  when the view's new content is empty. Publish an explicit `resync` (restart with
+  `send_snapshot` against a view that has at least one row) or clear the table if that state is
+  reached.
+- **One publication group, one publishing endpoint.** `output_group` names a single guard row;
+  two connectors sharing it cannot both publish a step, because the engine commits each endpoint
+  separately. Use one group per table.

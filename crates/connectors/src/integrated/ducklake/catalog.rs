@@ -270,9 +270,8 @@ impl Catalog {
         // surface as "the guard did not advance" — the right refusal, with a
         // cause that sent the operator looking in the wrong place.
         let number = |i: usize, column: &str| -> Result<u64> {
-            let text = cell(i).with_context(|| {
-                format!("guard row of {:?} has no {column}", self.output_group)
-            })?;
+            let text = cell(i)
+                .with_context(|| format!("guard row of {:?} has no {column}", self.output_group))?;
             text.parse().with_context(|| {
                 format!(
                     "guard row of {:?} has a non-numeric {column}: {text:?}",
@@ -354,8 +353,23 @@ impl Catalog {
     }
 
     /// Apply `batch` atomically with the guard update, or explain why not.
-    pub fn publish(&mut self, batch: &Batch, max_attempts: usize) -> Result<PublicationResult> {
-        protocol::validate(batch, &self.tables)?;
+    /// Publish one batch, retrying a detected conflict.
+    ///
+    /// `tables` is what this batch may touch.  An endpoint passes the single table it
+    /// publishes, so a resync clears only what it then repopulates; `None` means
+    /// every table this catalog knows about, which is what a group-wide publisher
+    /// would use.
+    pub fn publish(
+        &mut self,
+        batch: &Batch,
+        tables: Option<&[String]>,
+        max_attempts: usize,
+    ) -> Result<PublicationResult> {
+        let tables: Vec<String> = match tables {
+            Some(tables) => tables.to_vec(),
+            None => self.tables.clone(),
+        };
+        protocol::validate(batch, &tables)?;
         let mut conflict: Option<String> = None;
         for attempt in 1..=max_attempts.max(1) {
             if let Err(e) = self.conn.execute("BEGIN TRANSACTION", &[]) {
@@ -365,7 +379,7 @@ impl Catalog {
                 }
                 return Err(e);
             }
-            let outcome = self.attempt(batch);
+            let outcome = self.attempt(batch, &tables);
             let result = match outcome {
                 Ok(result) => result,
                 Err(e) => {
@@ -426,14 +440,14 @@ impl Catalog {
     }
 
     /// One attempt inside an open transaction.
-    fn attempt(&mut self, batch: &Batch) -> Result<Attempt> {
+    fn attempt(&mut self, batch: &Batch, tables: &[String]) -> Result<Attempt> {
         let guard = self.read_guard()?;
         let decision = protocol::decide(&guard, batch)?;
         if decision != Decision::Apply {
             return Ok(Attempt { decision, guard });
         }
         self.update_guard(&guard, batch)?;
-        self.apply_payload(batch)?;
+        self.apply_payload(batch, tables)?;
         Ok(Attempt { decision, guard })
     }
 
@@ -469,9 +483,9 @@ impl Catalog {
         Ok(())
     }
 
-    fn apply_payload(&mut self, batch: &Batch) -> Result<()> {
+    fn apply_payload(&mut self, batch: &Batch, tables: &[String]) -> Result<()> {
         if batch.resync {
-            for table in &self.tables {
+            for table in tables {
                 let sql = format!("DELETE FROM {}", self.qualified(table)?);
                 self.conn.execute(&sql, &[])?;
             }
@@ -498,7 +512,7 @@ impl Catalog {
         if let Some(keys) = self.keys.get(&delta.table).filter(|k| !k.is_empty()) {
             let predicate = keys
                 .iter()
-                .map(|k| Ok(format!("{} = ?", quote_ident(k)?)))
+                .map(|k| Ok(format!("{} IS NOT DISTINCT FROM ?", quote_ident(k)?)))
                 .collect::<Result<Vec<_>>>()?
                 .join(" AND ");
             let params: Result<Vec<Value>> = keys
@@ -509,7 +523,15 @@ impl Catalog {
                         .ok_or_else(|| anyhow!("row on {:?} has no key column {k:?}", delta.table))
                 })
                 .collect();
-            let sql = format!("DELETE FROM {target} WHERE {predicate}");
+            // One row per delete, for the same multiplicity reason as below, and
+            // `IS NOT DISTINCT FROM` so a NULL key matches the row it identifies:
+            // with `= ?` a NULL key matched nothing and every republish added
+            // another copy.  A keyed table is meant to hold one row per key, so
+            // matching one is the whole row either way.
+            let sql = format!(
+                "DELETE FROM {target} WHERE rowid IN (SELECT rowid FROM {target} WHERE \
+                 {predicate} LIMIT 1)"
+            );
             self.conn.execute(&sql, &params?)?;
         } else if delta.op == Op::Delete {
             // Multiplicity-preserving removal: exactly one matching row.
@@ -711,13 +733,13 @@ mod tests {
             resync: false,
         };
 
-        let first = catalog.publish(&batch, 8).expect("publish");
+        let first = catalog.publish(&batch, None, 8).expect("publish");
         assert_eq!(first.decision, Decision::Apply);
         assert_eq!(first.guard.frontier, 7);
         assert_eq!(first.guard.batch_id.as_deref(), Some("gen:0->7"));
 
         // The replay the engine produces when a step is repeated.
-        let replay = catalog.publish(&batch, 8).expect("replay");
+        let replay = catalog.publish(&batch, None, 8).expect("replay");
         assert_eq!(replay.decision, Decision::Duplicate);
 
         let count = catalog
@@ -733,7 +755,7 @@ mod tests {
         overtaken.base = 5;
         overtaken.end = 6;
         overtaken.deltas = vec![Delta::new("t", Op::Insert, json!({"id": 2, "x": "b"}))];
-        let stale = catalog.publish(&overtaken, 8).expect("stale publish");
+        let stale = catalog.publish(&overtaken, None, 8).expect("stale publish");
         assert_eq!(stale.decision, Decision::Stale);
         assert_eq!(
             catalog

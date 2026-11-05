@@ -240,10 +240,11 @@ impl DuckLakeWriter {
             // happens when a step's rows cancelled out exactly.
             return;
         }
+        let rows = deltas.len() as u64;
         match self.publish(step, deltas, resync) {
             // Report the frontier of the guard row this publication wrote, not a
             // fresh read: a read that fails must not turn into "frontier 0".
-            Ok(frontier) => self.report_progress(frontier),
+            Ok(frontier) => self.report_progress(frontier, rows),
             Err(e) => self.fail_and_hold(e),
         }
     }
@@ -281,7 +282,15 @@ impl DuckLakeWriter {
             resync,
         };
         protocol::validate(&batch, std::slice::from_ref(&target.table))?;
-        let result = catalog.publish(&batch, MAX_ATTEMPTS)?;
+        // The payload is this endpoint's table only, and a resync deletes only what
+        // it then repopulates.  Clearing every configured table here would let a
+        // second endpoint's resync wipe the rows a first one just published, with
+        // both guards advancing past them.
+        let result = catalog.publish(
+            &batch,
+            Some(std::slice::from_ref(&target.table)),
+            MAX_ATTEMPTS,
+        )?;
         match result.decision {
             protocol::Decision::Apply => {
                 tracing::debug!(
@@ -301,13 +310,23 @@ impl DuckLakeWriter {
                 );
                 Ok(result.guard.frontier)
             }
-            other => bail!(
-                "ducklake: {} refused {}: {} (frontier {})",
-                self.endpoint_name,
-                batch.batch_id(),
-                other.as_str(),
-                result.guard.frontier
-            ),
+            other => {
+                // A frontier ahead of this batch is the one situation an operator
+                // can recover from without a code change, so say how.
+                let hint = if other == protocol::Decision::Stale {
+                    ", the catalog is ahead of this pipeline; restart it with \
+                     send_snapshot enabled to resynchronise"
+                } else {
+                    ""
+                };
+                bail!(
+                    "ducklake: {} refused {}: {} (frontier {}){hint}",
+                    self.endpoint_name,
+                    batch.batch_id(),
+                    other.as_str(),
+                    result.guard.frontier
+                )
+            }
         }
     }
 
@@ -336,8 +355,11 @@ impl DuckLakeWriter {
         }
     }
 
-    fn report_progress(&self, frontier: u64) {
-        self.records_written.store(frontier, Ordering::Relaxed);
+    fn report_progress(&self, frontier: u64, rows: u64) {
+        // `records_written` is a record count in the engine's metrics; feeding it a
+        // frontier made progress reporting lie.  The frontier is traced instead.
+        tracing::debug!("ducklake: {} is at frontier {frontier}", self.endpoint_name);
+        self.records_written.store(rows, Ordering::Relaxed);
     }
 
     /// Turn the batch's rows into deltas.
@@ -472,6 +494,10 @@ impl Encoder for DuckLakeWriter {
                 // an error that is merely returned lets the step be counted as
                 // published while nothing was written.  The reference connector
                 // raises and stops for the same reason.
+                // Drop the step first: a snapshot batch has already set
+                // `pending.resync`, and publishing it with no rows would delete the
+                // endpoint's table and advance the guard over the hole.
+                self.pending.step = None;
                 self.fail_and_hold(e);
                 return Ok(());
             }
