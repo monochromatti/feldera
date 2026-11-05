@@ -48,6 +48,35 @@ fn catalog_config(dir: &TempDir) -> serde_json::Value {
     config
 }
 
+/// A writable copy of the vendored extension directory.
+///
+/// DuckDB `INSTALL`s extensions into the directory it found them in, and the
+/// vendored directory is a read-only store path, so a case that needs a second
+/// extension installed — the PostgreSQL scanner, for a PostgreSQL catalog — must
+/// be given a copy it may write to.  Measured: without this, `ATTACH` fails with
+/// `Cannot open file "…/postgres_scanner.duckdb_extension.tmp-…": Permission
+/// denied`.
+fn writable_extension_dir(dir: &TempDir) -> Option<String> {
+    let source = std::env::var("DUCKLAKE_EXTENSION_DIR").ok()?;
+    let target = dir.path().join("extensions");
+    copy_tree(std::path::Path::new(&source), &target).ok()?;
+    Some(target.display().to_string())
+}
+
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let destination = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &destination)?;
+        } else {
+            std::fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
 /// The writer configuration for one output group over one table.
 fn writer_config(dir: &TempDir, table: &str) -> serde_json::Value {
     let mut config = catalog_config(dir);
@@ -271,6 +300,264 @@ pub fn ducklake_input_bootstraps_and_then_follows(engine: &dyn PipelineTestEngin
     );
 }
 
+/// One pipeline reading one catalog and writing another.
+///
+/// This is the composition the two cases above cannot show: a DuckLake source and
+/// a DuckLake sink in one pipeline, each owning its own attachment.  Two catalogs
+/// rather than one because a file-backed catalog admits a single attachment — a
+/// reader and a writer of the same file catalog fence each other off, which is
+/// exactly why the same-catalog case needs PostgreSQL and lives in
+/// `two_engines_publishing_the_same_step_converge_on_one_outcome`.
+#[engine_test]
+pub fn ducklake_to_ducklake_copies_a_table_into_another(engine: &dyn PipelineTestEngine) {
+    let source_dir = TempDir::new().expect("a temp directory");
+    let sink_dir = TempDir::new().expect("a temp directory");
+
+    let mut source =
+        Catalog::open(&writer(&source_dir, "orders")).expect("attach the source catalog");
+    create_table(&mut source, "orders");
+    source
+        .execute_sql("INSERT INTO dl.main.orders VALUES (1, true, 10, 'a'), (2, false, NULL, 'b')")
+        .expect("seed the source table");
+    drop(source);
+
+    let mut sink =
+        Catalog::open(&writer(&sink_dir, "orders_out")).expect("attach the sink catalog");
+    create_table(&mut sink, "orders_out");
+    drop(sink);
+
+    let mut reader = catalog_config(&source_dir);
+    reader["table"] = json!("orders");
+    reader["poll_interval"] = json!("50ms");
+    let config = serde_json::from_value(json!({
+        "name": "ducklake_both",
+        "workers": 1,
+        "inputs": {
+            "rows": {
+                "stream": "test_input1",
+                "transport": { "name": "ducklake_input", "config": reader },
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "ducklake_output",
+                    "config": writer_config(&sink_dir, "orders_out"),
+                },
+            }
+        }
+    }))
+    .expect("a pipeline config");
+
+    let (error_sender, error_receiver) = crossbeam::channel::unbounded();
+    let controller = engine
+        .controller(
+            &TestCircuit::identity(relation()),
+            &config,
+            Box::new(move |error, _| {
+                let _ = error_sender.send(format!("ducklake_both suite: {error}"));
+            }),
+        )
+        .expect("start the controller");
+    controller.start();
+    controller
+        .start_input_endpoint("rows")
+        .expect("start the input endpoint");
+
+    wait(
+        || controller.status().num_total_processed_records() == 2 || !error_receiver.is_empty(),
+        60_000,
+    )
+    .expect("the source table to be read");
+    assert!(
+        error_receiver.is_empty(),
+        "the connector failed: {:?}",
+        error_receiver.try_iter().collect::<Vec<_>>()
+    );
+    controller.stop().expect("stop the controller");
+
+    let mut verify =
+        Catalog::open(&writer(&sink_dir, "orders_out")).expect("reattach the sink catalog");
+    assert_eq!(
+        verify
+            .rows("SELECT id, b, i, s FROM dl.main.orders_out ORDER BY id")
+            .expect("read the sink table"),
+        ["1|true|10|a", "2|false|NULL|b"],
+        "the sink table holds what the source table held"
+    );
+    assert!(
+        verify.frontier() >= 1,
+        "the sink recorded the step it published: {}",
+        verify.frontier()
+    );
+}
+
+/// A commit made by another *process* arrives in the pipeline.
+///
+/// Every other case here commits through this process's own DuckDB.  A
+/// deployment does not: the writer that changes the catalog is usually someone
+/// else's process, which is why the reader re-attaches on every poll instead of
+/// trusting the attachment it opened.  The case runs the `duckdb` CLI as that
+/// other process — a real second DuckDB, with its own transaction — and expects
+/// the pipeline to follow it.
+///
+/// The CLI is looked up in `DUCKLAKE_DUCKDB_CLI` and then on `PATH`; without it
+/// the case skips, because DuckDB in-process cannot stand in for a second
+/// process.
+#[engine_test(services(Postgres))]
+pub fn ducklake_input_follows_a_commit_from_another_process(engine: &dyn PipelineTestEngine) {
+    let Some(cli) = duckdb_cli() else {
+        eprintln!("skipping: no duckdb CLI (set DUCKLAKE_DUCKDB_CLI or put it on PATH)");
+        return;
+    };
+    let data = TempDir::new().expect("a temp directory");
+    let Some(dsn) = postgres_catalog("ducklake_cross_process") else {
+        eprintln!(
+            "skipping: no PostgreSQL server answers at {}",
+            Service::Postgres.address()
+        );
+        return;
+    };
+    let Some(extensions) = writable_extension_dir(&data) else {
+        eprintln!("skipping: DUCKLAKE_EXTENSION_DIR is not set");
+        return;
+    };
+
+    let mut provision = Catalog::open(
+        &serde_json::from_value::<DuckLakeWriterConfig>(postgres_writer_config(
+            &dsn, &data, "orders",
+        ))
+        .expect("a writer config"),
+    )
+    .expect("attach the catalog");
+    create_table(&mut provision, "orders");
+    provision
+        .execute_sql("INSERT INTO dl.main.orders VALUES (1, true, 10, 'a')")
+        .expect("seed the table");
+    drop(provision);
+
+    let output = tempfile::NamedTempFile::new().expect("a temp file");
+    let config = serde_json::from_value(json!({
+        "name": "ducklake_cross_process",
+        "workers": 1,
+        "inputs": {
+            "rows": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "ducklake_input",
+                    "config": {
+                        "catalog": dsn,
+                        "data_path": format!("{}/data", data.path().display()),
+                        "table": "orders",
+                        "poll_interval": "50ms",
+                        "extension_directory": extensions,
+                    }
+                },
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": { "name": "file_output", "config": { "path": output.path() } },
+                "format": {
+                    "name": "json",
+                    "config": { "update_format": "insert_delete" }
+                }
+            }
+        }
+    }))
+    .expect("a pipeline config");
+
+    let (error_sender, error_receiver) = crossbeam::channel::unbounded();
+    let controller = engine
+        .controller(
+            &TestCircuit::identity(relation()),
+            &config,
+            Box::new(move |error, _| {
+                let _ = error_sender.send(format!("ducklake_cross_process suite: {error}"));
+            }),
+        )
+        .expect("start the controller");
+    controller.start();
+    controller
+        .start_input_endpoint("rows")
+        .expect("start the input endpoint");
+    wait(
+        || controller.status().num_total_processed_records() == 1 || !error_receiver.is_empty(),
+        60_000,
+    )
+    .expect("the bootstrap to be processed");
+
+    // The other process: a second DuckDB, with its own transaction, committing a
+    // row into the same catalog while the pipeline runs.
+    let script = format!(
+        "SET extension_directory = '{extensions}';\
+         LOAD ducklake;\
+         ATTACH '{dsn}' AS dl (DATA_PATH '{}');\
+         INSERT INTO dl.main.orders VALUES (2, false, 20, 'b');",
+        data.path().join("data").display(),
+    );
+    let status = std::process::Command::new(&cli)
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .expect("run the duckdb CLI");
+    assert!(status.success(), "the external commit failed: {status}");
+
+    wait(
+        || controller.status().num_total_processed_records() >= 2 || !error_receiver.is_empty(),
+        60_000,
+    )
+    .expect("the external commit to be followed");
+    assert!(
+        error_receiver.is_empty(),
+        "the connector failed: {:?}",
+        error_receiver.try_iter().collect::<Vec<_>>()
+    );
+    controller.stop().expect("stop the controller");
+
+    let expected = Updates::from_json(
+        published_schema(&relation()),
+        &[
+            (1, r#"{"id": 1, "b": true, "i": 10, "s": "a"}"#),
+            (1, r#"{"id": 2, "b": false, "i": 20, "s": "b"}"#),
+        ],
+    )
+    .expect("expected rows");
+    let actual = read::insert_delete_updates(&relation(), &std::fs::read(output.path()).unwrap())
+        .expect("parse the output file");
+    assert_eq!(actual, expected, "the row another process committed");
+}
+
+/// The `duckdb` CLI that matches the vendored extension, if there is one.
+///
+/// A CLI is the only way this suite can produce a commit from a second process, and
+/// it has to be the same DuckDB version as the extension that will be loaded into
+/// it: a `1.5.2` CLI on `PATH` beside the vendored `2.0.0` extension is a
+/// confusing failure rather than a skip, so the version is checked rather than
+/// assumed.
+fn duckdb_cli() -> Option<String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("DUCKLAKE_DUCKDB_CLI") {
+        candidates.push(path.into());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("duckdb")));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.is_file()
+                && std::process::Command::new(candidate)
+                    .arg("--version")
+                    .output()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).contains("v2.0.0"))
+                    .unwrap_or(false)
+        })
+        .map(|candidate| candidate.display().to_string())
+}
+
 /// A catalog in a fresh database on the `Postgres` service, as an `ATTACH`
 /// string.
 ///
@@ -316,7 +603,7 @@ fn postgres_writer_config(dsn: &str, data: &TempDir, table: &str) -> serde_json:
         "generation": "gen-1",
         "tables": { "test_output1": { "table": table } },
     });
-    if let Ok(extension_directory) = std::env::var("DUCKLAKE_EXTENSION_DIR") {
+    if let Some(extension_directory) = writable_extension_dir(data) {
         config["extension_directory"] = json!(extension_directory);
     }
     config
@@ -436,7 +723,7 @@ pub fn two_engines_publishing_the_same_step_converge_on_one_outcome(
         "poll_interval": "50ms",
     });
     let mut reader = reader.as_object().expect("an object").clone();
-    if let Ok(extension_directory) = std::env::var("DUCKLAKE_EXTENSION_DIR") {
+    if let Some(extension_directory) = writable_extension_dir(&data) {
         reader.insert("extension_directory".to_owned(), json!(extension_directory));
     }
     let config = serde_json::from_value(json!({

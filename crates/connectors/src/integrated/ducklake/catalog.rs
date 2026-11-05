@@ -24,6 +24,7 @@ use super::ffi::{Conn, Db, Library, Value};
 use super::protocol::{self, Batch, Decision, Delta, Guard, Op};
 
 /// Outcome of one publication (possibly after retries).
+#[derive(Debug)]
 pub struct PublicationResult {
     pub decision: Decision,
     pub guard: Guard,
@@ -537,6 +538,28 @@ impl Catalog {
         let rows = self.conn.query(sql, &[])?.into_rows();
         Ok(rows.first().and_then(|row| row.first().cloned().flatten()))
     }
+
+    /// Every row of `sql`, each rendered as `cell|cell|…`.
+    ///
+    /// Tests assert on whole tables rather than on one scalar, because the
+    /// failure they prevent — a row algebra that deletes one row too many — is
+    /// invisible when only a count is checked.
+    pub(crate) fn rows(&mut self, sql: &str) -> Result<Vec<String>> {
+        Ok(flattened(self.conn.query(sql, &[])?.into_rows()))
+    }
+}
+
+/// Render query results as one `cell|cell|…` string per row, `NULL` for null.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn flattened(rows: Vec<Vec<Option<String>>>) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| cell.unwrap_or_else(|| "NULL".to_owned()))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
 }
 
 #[cfg(test)]

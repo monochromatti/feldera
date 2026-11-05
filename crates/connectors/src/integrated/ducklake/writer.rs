@@ -252,7 +252,7 @@ impl DuckLakeWriter {
             deltas,
             resync,
         };
-        protocol::validate(&batch, &[target.table.clone()])?;
+        protocol::validate(&batch, std::slice::from_ref(&target.table))?;
         let result = catalog.publish(&batch, MAX_ATTEMPTS)?;
         match result.decision {
             protocol::Decision::Apply => {

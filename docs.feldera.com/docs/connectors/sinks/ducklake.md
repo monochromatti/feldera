@@ -78,7 +78,7 @@ catalog is the only place the connector records progress.
 | `epoch`                  | integer |                    | Ownership epoch. Must strictly increase to take over a group from a previous owner; see [taking over a group](#taking-over-a-group). |
 | `send_snapshot`          | bool    | `true`             | Resynchronize from the engine's snapshot when the guard row is behind the tables. Disable to turn that situation into a startup error instead. |
 | `data_path`              | string  |                    | Directory for DuckLake's data files, overriding the catalog's own setting. Needed when the catalog was created with a data path that is not valid from the pipeline host. |
-| `extension_directory`    | string  |                    | Directory holding `ducklake.duckdb_extension`. Unset lets DuckDB download it on first use, which fails on a host without egress; see [deployment](#deployment). |
+| `extension_directory`    | string  |                    | Directory holding `ducklake.duckdb_extension`. Unset lets DuckDB download it on first use, which fails on a host without egress; see [deployment](#deployment). Must be writable if the catalog needs another extension, which a PostgreSQL-backed catalog always does. |
 | `inlining_row_limit`     | integer | catalog's default  | Rows per data file stored inline in the catalog. |
 
 [*]: Required fields

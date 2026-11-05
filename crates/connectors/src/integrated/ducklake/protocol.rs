@@ -312,7 +312,7 @@ pub fn validate(batch: &Batch, known_tables: &[String]) -> Result<()> {
                 delta.row
             );
         }
-        if !known_tables.iter().any(|t| *t == delta.table) {
+        if !known_tables.contains(&delta.table) {
             bail!(
                 "batch writes table {:?}, which this output group does not own (it owns {known_tables:?})",
                 delta.table
@@ -464,5 +464,48 @@ mod tests {
         let b = batch("gen", 1, 0, 1);
         let err = validate(&b, &["other".to_owned()]).expect_err("table is not owned");
         assert!(format!("{err}").contains("does not own"), "{err}");
+    }
+
+    /// `decide` answers for every reachable pair of guard and batch, and every
+    /// `Apply` moves the frontier to the batch's end.
+    ///
+    /// The failure this prevents is a writer that faces a state the protocol did
+    /// not consider — a panic, or worse an `Apply` that leaves the frontier where
+    /// it was, which would make the next attempt apply the batch again.
+    #[test]
+    fn the_decision_is_total() {
+        let mut applied = 0;
+        for frontier in [NOWHERE, 0, 1, 2, 5] {
+            for base in [NOWHERE, 0, 1, 3] {
+                for end in [NOWHERE, 0, 1, 2, 6] {
+                    for resync in [false, true] {
+                        for (generation, epoch) in [("gen", 1), ("other", 1), ("gen", 2)] {
+                            let g = Guard {
+                                frontier,
+                                ..guard(0)
+                            };
+                            let b = Batch {
+                                base,
+                                end,
+                                resync,
+                                ..batch(generation, epoch, 0, 1)
+                            };
+                            // The only error is a divergent digest, which cannot
+                            // arise here: the batch carries its own content.
+                            let decision = decided(&g, &b);
+                            if decision == Decision::Apply {
+                                applied += 1;
+                                assert_eq!(
+                                    advance(&g, &b).frontier,
+                                    end,
+                                    "an apply of {b:?} on {g:?} must move the frontier to its end"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(applied > 0, "no case applied, so the sweep proves nothing");
     }
 }

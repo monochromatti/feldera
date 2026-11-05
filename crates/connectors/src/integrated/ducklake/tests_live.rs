@@ -149,6 +149,260 @@ fn the_frontier_survives_reopening_the_catalog() {
     );
 }
 
+/// The batch that follows another one: same group and run, no resync.
+fn step(catalog: &Catalog, base: u64, end: u64, deltas: Vec<Delta>) -> Batch {
+    Batch {
+        base,
+        end,
+        resync: false,
+        deltas,
+        ..batch(catalog)
+    }
+}
+
+/// The catalog's committed snapshot, read the way the connector reads it.
+fn snapshot(catalog: &mut Catalog) -> u64 {
+    catalog
+        .scalar("SELECT * FROM ducklake_current_snapshot('dl')")
+        .expect("read the current snapshot")
+        .expect("a snapshot number")
+        .parse()
+        .expect("a snapshot number")
+}
+
+/// A payload that fails must take the guard update down with it.
+///
+/// The failure this prevents is the one the protocol exists for: a guard that
+/// records step 2 while the payload of step 2 rolled back would turn every retry
+/// into a `DUPLICATE` and lose that step's output for good.  The snapshot count
+/// is pinned too, because one publication must be one snapshot — that is what
+/// lets a reader see the payload and the guard together.
+#[test]
+fn a_payload_failure_leaves_the_guard_and_the_history_where_they_were() {
+    let Some(config) = live_config("atomic") else {
+        return;
+    };
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    catalog
+        .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR NOT NULL)")
+        .expect("create the sink table");
+    let first = batch(&catalog);
+    catalog.publish(&first, 8).expect("the first publication");
+    let committed = snapshot(&mut catalog);
+
+    let bad = step(
+        &catalog,
+        1,
+        2,
+        vec![Delta::new(
+            "orders",
+            Op::Insert,
+            json!({"id": 3, "name": null}),
+        )],
+    );
+    let error = catalog
+        .publish(&bad, 1)
+        .expect_err("a NOT NULL violation must fail the publication");
+    assert!(
+        format!("{error:#}").contains("NOT NULL"),
+        "unexpected error: {error:#}"
+    );
+
+    assert_eq!(
+        catalog.frontier(),
+        1,
+        "the guard moved for a failed payload"
+    );
+    assert_eq!(
+        catalog
+            .rows("SELECT id, name FROM dl.orders ORDER BY id")
+            .unwrap(),
+        ["1|a", "2|b"],
+        "a failed publication changed the payload"
+    );
+    assert_eq!(
+        snapshot(&mut catalog),
+        committed,
+        "a failed publication left a snapshot behind"
+    );
+}
+
+/// A payload that diverges from the committed one is refused, not mistaken for a
+/// retry.
+///
+/// The identity of a batch is its generation and interval; the digest is what
+/// tells a replay from a lie.  Treating a divergent payload as a duplicate would
+/// keep the wrong rows and call the divergence a success.
+#[test]
+fn a_divergent_payload_for_a_committed_identity_is_refused() {
+    let Some(config) = live_config("divergent") else {
+        return;
+    };
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    catalog
+        .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
+        .expect("create the sink table");
+    let first = batch(&catalog);
+    catalog.publish(&first, 8).expect("the first publication");
+
+    // Same identity — generation and interval — with different content.
+    let mut divergent = batch(&catalog);
+    divergent.deltas = vec![Delta::new(
+        "orders",
+        Op::Insert,
+        json!({"id": 1, "name": "zzz"}),
+    )];
+    let error = catalog
+        .publish(&divergent, 1)
+        .expect_err("a divergent payload is not a duplicate");
+    assert!(
+        format!("{error:#}").contains("different content"),
+        "unexpected error: {error:#}"
+    );
+
+    assert_eq!(
+        catalog
+            .rows("SELECT id, name FROM dl.orders ORDER BY id")
+            .unwrap(),
+        ["1|a", "2|b"],
+        "the refused payload was applied anyway"
+    );
+    assert_eq!(catalog.frontier(), 1);
+}
+
+/// A resync replaces the whole content, and replaying it is still a duplicate.
+///
+/// This is the only case where a batch may apply from a frontier it does not sit
+/// on: a resync is a statement about the target's *content*, not a step in the
+/// sequence.  It must not become a way to apply an old step twice.
+#[test]
+fn a_resync_replaces_the_content_and_replays_as_a_duplicate() {
+    let Some(config) = live_config("resync") else {
+        return;
+    };
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    catalog
+        .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
+        .expect("create the sink table");
+    let first = batch(&catalog);
+    catalog.publish(&first, 8).expect("the first publication");
+
+    // Row 1 disappears, row 2 is rewritten: the batch is the whole content.
+    let resync = Batch {
+        base: 0,
+        end: 5,
+        deltas: vec![Delta::new(
+            "orders",
+            Op::Insert,
+            json!({"id": 2, "name": "b2"}),
+        )],
+        ..batch(&catalog)
+    };
+    let result = catalog.publish(&resync, 8).expect("a resync applies");
+    assert_eq!(result.decision, Decision::Apply);
+    assert_eq!(
+        catalog
+            .rows("SELECT id, name FROM dl.orders ORDER BY id")
+            .unwrap(),
+        ["2|b2"],
+        "a resync must leave exactly its own content"
+    );
+
+    let replay = catalog.publish(&resync, 8).expect("a replayed resync");
+    assert_eq!(replay.decision, Decision::Duplicate);
+    assert_eq!(
+        catalog
+            .rows("SELECT id, name FROM dl.orders ORDER BY id")
+            .unwrap(),
+        ["2|b2"],
+        "a replayed resync applied twice"
+    );
+}
+
+/// A keyed update replaces by key, leaving only the post-image.
+#[test]
+fn a_keyed_update_leaves_the_post_image() {
+    let Some(mut config) = live_config("keyed") else {
+        return;
+    };
+    for sink in config.tables.values_mut() {
+        sink.key_columns = vec!["id".to_owned()];
+    }
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    catalog
+        .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
+        .expect("create the sink table");
+
+    let first = step(
+        &catalog,
+        0,
+        1,
+        vec![Delta::new(
+            "orders",
+            Op::Insert,
+            json!({"id": 1, "name": "a"}),
+        )],
+    );
+    catalog.publish(&first, 8).expect("the first publication");
+
+    let update = step(
+        &catalog,
+        1,
+        2,
+        vec![
+            Delta::new("orders", Op::Delete, json!({"id": 1, "name": "a"})),
+            Delta::new("orders", Op::Insert, json!({"id": 1, "name": "a2"})),
+        ],
+    );
+    catalog.publish(&update, 8).expect("the update");
+    assert_eq!(
+        catalog
+            .rows("SELECT id, name FROM dl.orders ORDER BY id")
+            .unwrap(),
+        ["1|a2"],
+        "a keyed update must leave exactly the post-image"
+    );
+}
+
+/// Without key columns the table is a bag: a delete removes one copy.
+///
+/// Removing every matching row would turn a multiset into a set and lose a row
+/// the engine still counts.
+#[test]
+fn a_multiset_delete_removes_one_copy() {
+    let Some(config) = live_config("multiset") else {
+        return;
+    };
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    catalog
+        .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
+        .expect("create the sink table");
+    let row = json!({"id": 7, "name": "a"});
+
+    let first = step(
+        &catalog,
+        0,
+        1,
+        vec![
+            Delta::new("orders", Op::Insert, row.clone()),
+            Delta::new("orders", Op::Insert, row.clone()),
+        ],
+    );
+    catalog.publish(&first, 8).expect("two copies of one row");
+    assert_eq!(
+        catalog.rows("SELECT id, name FROM dl.orders").unwrap(),
+        ["7|a", "7|a"]
+    );
+
+    let second = step(&catalog, 1, 2, vec![Delta::new("orders", Op::Delete, row)]);
+    catalog.publish(&second, 8).expect("a single delete");
+    assert_eq!(
+        catalog.rows("SELECT id, name FROM dl.orders").unwrap(),
+        ["7|a"],
+        "the delete removed every copy instead of one"
+    );
+}
+
 /// The projection the reader builds from a relation, for the two-column test
 /// table.  Spelled out here so the test fails if the reader's projection stops
 /// matching what `to_json` needs.
@@ -289,7 +543,7 @@ use feldera_adapterlib::{
     },
     errors::controller::ControllerError,
     format::{BufferSize, InputBuffer, ParseError},
-    transport::{InputConsumer, InputReader, Resume, Watermark},
+    transport::{InputConsumer, Resume, Watermark},
 };
 use feldera_types::{
     adapter_stats::ConnectorHealth,
