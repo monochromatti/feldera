@@ -343,7 +343,7 @@ pub(super) fn push(
 }
 
 /// Build the JSON projection for a relation.
-fn projection(relation: &Relation) -> AnyResult<String> {
+pub(super) fn projection(relation: &Relation) -> AnyResult<String> {
     if relation.fields.is_empty() {
         bail!("the DuckLake input table has no columns");
     }

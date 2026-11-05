@@ -37,6 +37,12 @@ fn live_config(name: &str) -> Option<DuckLakeWriterConfig> {
     if std::env::var_os("DUCKLAKE_DUCKDB_LIB").is_none()
         || std::env::var_os("DUCKLAKE_EXTENSION_DIR").is_none()
     {
+        // Said out loud, and once per case: a bare `return` is indistinguishable
+        // from a pass in the harness output, so a suite that silently ran nothing
+        // reads as a suite that passed.
+        eprintln!(
+            "[skipped] {name}: set DUCKLAKE_DUCKDB_LIB and DUCKLAKE_EXTENSION_DIR to run the live cases"
+        );
         return None;
     }
     let root = std::env::temp_dir().join(format!("fd-ducklake-{name}-{}", std::process::id()));
@@ -66,7 +72,12 @@ fn live_config(name: &str) -> Option<DuckLakeWriterConfig> {
     })
 }
 
-/// The batch a step would produce: two rows, inserted into an empty table.
+/// A batch that *appends* rather than replacing the target's content.
+///
+/// The idempotency tests use this rather than a resync on purpose: reapplying a
+/// resync yields the same rows as applying it once, so a row count cannot tell
+/// `Duplicate` from `Apply` twice.  An append that is applied twice doubles the
+/// rows, which is the corruption the guard row exists to prevent.
 fn batch(catalog: &Catalog) -> Batch {
     Batch {
         output_group: "orders".to_owned(),
@@ -74,7 +85,7 @@ fn batch(catalog: &Catalog) -> Batch {
         epoch: catalog.epoch(),
         base: 0,
         end: 1,
-        resync: true,
+        resync: false,
         deltas: vec![
             Delta::new("orders", Op::Insert, json!({"id": 1, "name": "a"})),
             Delta::new("orders", Op::Insert, json!({"id": 2, "name": "b"})),
@@ -295,6 +306,10 @@ fn a_resync_replaces_the_content_and_replays_as_a_duplicate() {
     let resync = Batch {
         base: 0,
         end: 5,
+        // Explicit: this case is *about* resync, and it used to inherit the flag
+        // from the shared helper — so renaming the helper's default would have
+        // silently turned this into an append that the guard classifies `Stale`.
+        resync: true,
         deltas: vec![Delta::new(
             "orders",
             Op::Insert,
@@ -449,9 +464,12 @@ fn the_extension_is_loaded_from_the_configured_directory() {
 }
 
 /// The projection the reader builds from a relation, for the two-column test
-/// table.  Spelled out here so the test fails if the reader's projection stops
-/// matching what `to_json` needs.
-const PROJECTION: &str = r#"{'id': "id", 'name': "name"}"#;
+/// table.  Computed by the reader's own code rather than spelled out here: a
+/// hand-written copy would agree with itself about key quoting, which is exactly
+/// what the copy is supposed to catch.
+fn projection() -> String {
+    super::reader::projection(&orders_relation()).expect("the reader's projection")
+}
 
 /// Run one read attempt and collect what it handed on.
 fn advance_once(
@@ -459,7 +477,9 @@ fn advance_once(
     state: ReaderState,
 ) -> (Vec<(String, String)>, ReaderState) {
     let catalog = ReaderCatalog::attach(&config.catalog).expect("attach the catalog read-only");
-    let table = Table::new(&config.catalog, "main", "orders", PROJECTION).expect("a table address");
+    let projection = projection();
+    let table =
+        Table::new(&config.catalog, "main", "orders", &projection).expect("a table address");
     let mut pushed = Vec::new();
     let next = {
         let mut sink = |change_type: &str, json: &str| {

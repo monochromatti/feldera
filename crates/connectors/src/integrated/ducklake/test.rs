@@ -44,6 +44,14 @@ fn catalog_config(dir: &TempDir) -> serde_json::Value {
     });
     if let Ok(extension_directory) = std::env::var("DUCKLAKE_EXTENSION_DIR") {
         config["extension_directory"] = json!(extension_directory);
+    } else {
+        // Refused rather than defaulted: without it the connector would fall back
+        // to `INSTALL ducklake`, so the case would either reach the network or
+        // fail as though the connector were broken — neither is what a test that
+        // forgot its environment should report.
+        panic!(
+            "DUCKLAKE_EXTENSION_DIR is not set; the engine tests need the vendored extension so DuckDB never reaches the network"
+        );
     }
     config
 }
@@ -608,7 +616,18 @@ fn duckdb_cli() -> Option<String> {
                 && std::process::Command::new(candidate)
                     .arg("--version")
                     .output()
-                    .map(|out| String::from_utf8_lossy(&out.stdout).contains("v2.0.0"))
+                    .map(|out| {
+                        // Parsed, not substring-matched: `2.0.1` and a banner that
+                        // merely mentions the version must both be accepted, and
+                        // a `1.5.2` beside a `2.0` extension must not be.
+                        let version = String::from_utf8_lossy(&out.stdout);
+                        let major = version
+                            .split_whitespace()
+                            .find_map(|word| word.strip_prefix('v'))
+                            .and_then(|word| word.split('.').next())
+                            .and_then(|major| major.parse::<u32>().ok());
+                        out.status.success() && major == Some(2)
+                    })
                     .unwrap_or(false)
         })
         .map(|candidate| candidate.display().to_string())
