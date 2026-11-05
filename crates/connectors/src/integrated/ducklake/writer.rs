@@ -111,8 +111,20 @@ impl DuckLakeWriter {
         controller: Weak<ControllerInner>,
         shutdown: CancellationToken,
         _continue_previous_state: bool,
+        is_index: bool,
         enable_output_buffer: bool,
     ) -> Result<Self, ControllerError> {
+        // An indexed z-set carries a key the connector would have to honour for
+        // `COUNT`-style views to stay consistent; this sink writes plain rows, so
+        // accepting the flag and ignoring it would silently change the semantics of
+        // a view that asked to be indexed.  Postgres and DynamoDB refuse the
+        // combination for the same reason.
+        if is_index {
+            return Err(ControllerError::not_supported(
+                "The DuckLake output connector does not support indexed views. Remove the `index` \
+                 property from the view, or use a connector that supports it.",
+            ));
+        }
         // A buffered step is a different step: the controller would hand this
         // writer a batch covering several steps, and the guard row can name only
         // one.  Refusing at construction is better than publishing output the
@@ -153,13 +165,14 @@ impl DuckLakeWriter {
                 self.endpoint_name
             );
         }
+        // The view name is matched exactly, and only exactly.  This used to accept
+        // `view.replace('.', "_") == endpoint_name` as well, which makes views `a.b`
+        // and `a_b` both match an endpoint called `a_b` — two entries claiming one
+        // endpoint, resolved by whichever came first in a `BTreeMap`.  A name that
+        // does not match is refused with the names that were configured.
         let chosen: Vec<(&String, _)> = tables
             .iter()
-            .filter(|(view, _)| {
-                tables.len() == 1
-                    || **view == self.endpoint_name
-                    || view.replace('.', "_") == self.endpoint_name
-            })
+            .filter(|(view, _)| **view == self.endpoint_name)
             .collect();
         let chosen = if chosen.len() == 1 {
             chosen
@@ -377,9 +390,28 @@ impl OutputConsumer for DuckLakeWriter {
 
     fn batch_start(&mut self, step: Step, batch_type: OutputBatchType) {
         self.records_written.store(0, Ordering::Relaxed);
+        let resync = match batch_type {
+            OutputBatchType::Snapshot => {
+                // The engine is starting over: it sends the whole content rather
+                // than a delta.  `send_snapshot: false` documents that a deployment
+                // which suspects the catalog and the engine disagree would rather
+                // fail than have its tables rewritten, so this is where that promise
+                // is kept — until now the flag was accepted and never read.
+                if !self.config.send_snapshot {
+                    self.fail_and_hold(anyhow!(
+                        "the engine sent a snapshot for {} but `send_snapshot` is false; \
+                         the catalog was not rewritten",
+                        self.endpoint_name
+                    ));
+                    return;
+                }
+                true
+            }
+            OutputBatchType::Delta => false,
+        };
         self.pending = Pending {
             step: Some(step),
-            resync: matches!(batch_type, OutputBatchType::Snapshot),
+            resync,
             deltas: Vec::new(),
         };
     }
@@ -503,8 +535,37 @@ mod tests {
             CancellationToken::new(),
             false,
             false,
+            false,
         )
         .expect("writer")
+    }
+
+    /// An indexed view is refused at startup, like the Postgres and DynamoDB sinks
+    /// do.  The sink writes plain rows; accepting the flag and ignoring it would
+    /// silently change the semantics of a view that asked to be indexed, and the
+    /// engine would have no way to notice.
+    #[test]
+    fn an_indexed_view_is_refused() {
+        let refused = DuckLakeWriter::new(
+            0,
+            "v",
+            &config(&[("v", "t")]),
+            &None,
+            &Relation::empty(),
+            Weak::new(),
+            CancellationToken::new(),
+            false,
+            true,
+            false,
+        );
+        // `is_err` first: `DuckLakeWriter` is not `Debug`, so `expect_err` does not
+        // apply.
+        assert!(refused.is_err(), "an indexed view must be refused");
+        let error = refused.err().expect("checked above");
+        assert!(
+            format!("{error}").contains("indexed"),
+            "the error names the reason: {error}"
+        );
     }
 
     #[test]

@@ -27,9 +27,11 @@ WITH (
             "name": "ducklake_output",
             "config": {
                 "catalog": "ducklake:postgres:dbname=ducklake host=db.internal",
-                "table": "orders",
                 "output_group": "orders",
-                "generation": "v1"
+                "generation": "v1",
+                "tables": {
+                    "orders_out": { "table": "orders" }
+                }
             }
         }
     }]'
@@ -68,15 +70,15 @@ catalog is the only place the connector records progress.
 | Property                 | Type    | Default            | Description |
 |--------------------------|---------|--------------------|-------------|
 | `catalog`*               | string  |                    | Catalog to attach, in DuckDB's `ATTACH` grammar: `ducklake:/path/to/meta.ducklake`, `ducklake:postgres:dbname=ducklake host=...`. The connector passes it through unchanged. |
-| `table`*                 | string  |                    | DuckLake table to write the view's rows to. Must already exist; see [schema contract](#schema-contract). |
+| `tables`*                | map     |                    | View name -> where its rows go. Each entry is `{"table": "<ducklake table>", "key_columns": [...]}`. The table must already exist; see [schema contract](#schema-contract). The engine creates one endpoint per view, so a view with no entry, or an entry with no view, is refused at startup. |
 | `output_group`*          | string  |                    | Name of the publication group. One guard row per group: two connectors sharing a group fence each other off instead of interleaving writes to the same rows. |
 | `generation`*            | string  |                    | Identity of this publication arrangement, for example a pipeline generation. Part of every batch identity. |
 | `guard_table`            | string  | `connector_guard`  | Table holding the group's guard row, in the catalog schema below. |
 | `schema`                 | string  | `main`             | DuckLake schema that holds the output tables and the guard table. |
-| `key_columns`            | array   | `[]`               | Columns that identify a row. With key columns the connector replaces by key; without them it deletes one matching row and inserts one, keeping the table a bag. |
+| `tables.<view>.key_columns` | array | `[]`             | Columns that identify a row. With key columns the connector replaces by key; without them it deletes one matching row and inserts one, keeping the table a bag. |
 | `alias`                  | string  | `dl`               | Name under which the catalog is attached on the connector's connection. It must differ from the name of any other catalog the pipeline attaches. |
 | `epoch`                  | integer |                    | Ownership epoch. Must strictly increase to take over a group from a previous owner; see [taking over a group](#taking-over-a-group). |
-| `send_snapshot`          | bool    | `true`             | Resynchronize from the engine's snapshot when the guard row is behind the tables. Disable to turn that situation into a startup error instead. |
+| `send_snapshot`          | bool    | `true`             | Accept a full snapshot from the engine, which rewrites the table. With `false`, a snapshot is refused and the connector reports an error instead of rewriting, for a deployment that would rather stop than have its tables replaced. |
 | `data_path`              | string  |                    | Directory for DuckLake's data files, overriding the catalog's own setting. Needed when the catalog was created with a data path that is not valid from the pipeline host. |
 | `extension_directory`    | string  |                    | Directory holding `ducklake.duckdb_extension`. Unset lets DuckDB download it on first use, which fails on a host without egress; see [deployment](#deployment). Must contain, or be writable enough for DuckDB to install, every extension the catalog needs — a PostgreSQL-backed catalog also needs `postgres_scanner`. |
 | `inlining_row_limit`     | integer | catalog's default  | Rows per data file stored inline in the catalog. |
