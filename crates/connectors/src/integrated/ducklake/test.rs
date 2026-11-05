@@ -48,19 +48,44 @@ fn catalog_config(dir: &TempDir) -> serde_json::Value {
     config
 }
 
-/// A writable copy of the vendored extension directory.
+/// The `extension_directory` a case should configure.
 ///
-/// DuckDB `INSTALL`s extensions into the directory it found them in, and the
-/// vendored directory is a read-only store path, so a case that needs a second
-/// extension installed — the PostgreSQL scanner, for a PostgreSQL catalog — must
-/// be given a copy it may write to.  Measured: without this, `ATTACH` fails with
-/// `Cannot open file "…/postgres_scanner.duckdb_extension.tmp-…": Permission
-/// denied`.
-fn writable_extension_dir(dir: &TempDir) -> Option<String> {
+/// DuckDB writes into that directory only when it has to `INSTALL` something, and
+/// a PostgreSQL catalog makes DuckLake load `postgres_scanner` — the one
+/// extension this connector needs beyond `ducklake` itself.  Two cases, and both
+/// are load-bearing:
+///
+/// - the vendored directory already ships `postgres_scanner` (the derivation
+///   vendors both), so it is used **as is**: a read-only directory suffices, and
+///   running against the read-only path is what keeps that a fact rather than a
+///   claim (verified with DuckDB 2.0.0: `ATTACH` succeeds with the store path);
+/// - it does not, so the directory is copied somewhere writable, because the
+///   `ATTACH` would otherwise fail with `Cannot open file
+///   "…/postgres_scanner.duckdb_extension.tmp-…": Permission denied` (measured).
+fn extension_dir(dir: &TempDir) -> Option<String> {
     let source = std::env::var("DUCKLAKE_EXTENSION_DIR").ok()?;
+    if has_extension(std::path::Path::new(&source), "postgres_scanner") {
+        return Some(source);
+    }
     let target = dir.path().join("extensions");
     copy_tree(std::path::Path::new(&source), &target).ok()?;
     Some(target.display().to_string())
+}
+
+/// Whether `dir` holds a `name` extension anywhere below it.
+fn has_extension(dir: &std::path::Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return has_extension(&path, name);
+        }
+        path.file_name()
+            .and_then(|file| file.to_str())
+            .is_some_and(|file| file.starts_with(name) && file.ends_with(".duckdb_extension"))
+    })
 }
 
 fn copy_tree(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
@@ -419,7 +444,7 @@ pub fn ducklake_input_follows_a_commit_from_another_process(engine: &dyn Pipelin
         );
         return;
     };
-    let Some(extensions) = writable_extension_dir(&data) else {
+    let Some(extensions) = extension_dir(&data) else {
         eprintln!("skipping: DUCKLAKE_EXTENSION_DIR is not set");
         return;
     };
@@ -603,7 +628,7 @@ fn postgres_writer_config(dsn: &str, data: &TempDir, table: &str) -> serde_json:
         "generation": "gen-1",
         "tables": { "test_output1": { "table": table } },
     });
-    if let Some(extension_directory) = writable_extension_dir(data) {
+    if let Some(extension_directory) = extension_dir(data) {
         config["extension_directory"] = json!(extension_directory);
     }
     config
@@ -723,7 +748,7 @@ pub fn two_engines_publishing_the_same_step_converge_on_one_outcome(
         "poll_interval": "50ms",
     });
     let mut reader = reader.as_object().expect("an object").clone();
-    if let Some(extension_directory) = writable_extension_dir(&data) {
+    if let Some(extension_directory) = extension_dir(&data) {
         reader.insert("extension_directory".to_owned(), json!(extension_directory));
     }
     let config = serde_json::from_value(json!({

@@ -60,7 +60,7 @@ again.
 | `poll_interval`         | duration| `1s`              | How often to ask the catalog for new changes, for example `500ms`. |
 | `alias`                 | string  | `dl`              | Name under which the catalog is attached on the connector's connection. It must differ from the name of any other catalog the pipeline attaches. |
 | `data_path`             | string  |                   | Directory holding DuckLake's data files, overriding the catalog's own setting. Needed when the catalog was created with a data path that is not valid from the pipeline host. |
-| `extension_directory`   | string  |                   | Directory holding `ducklake.duckdb_extension`. Unset lets DuckDB download it on first use, which fails on a host without egress; see [deployment](#deployment). Must be writable if the catalog needs another extension — a PostgreSQL-backed catalog always does. |
+| `extension_directory`   | string  |                   | Directory holding `ducklake.duckdb_extension`. Unset lets DuckDB download it on first use, which fails on a host without egress; see [deployment](#deployment). Must contain, or be writable enough for DuckDB to install, every extension the catalog needs; a PostgreSQL-backed catalog also needs `postgres_scanner`. |
 | `inlining_row_limit`    | integer | catalog's default | Rows per data file stored inline in the catalog. |
 
 [*]: Required fields
