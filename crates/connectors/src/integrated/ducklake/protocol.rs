@@ -1,13 +1,21 @@
 //! The publication protocol: batch identity, the guard row, and the decision.
 //!
 //! This is the native counterpart of the Python bridge's `protocol.py`, and the
-//! vocabulary is deliberately the same so that a catalog written by one is read
-//! by the other:
+//! vocabulary is deliberately the same:
 //!
 //! `frontier`
-//!     The batch id the group has committed.  `0` means "nothing yet".  Here it
-//!     is a DBSP **transaction id**, which the engine reproduces deterministically
-//!     across replay, so it is stable across restarts of the process.
+//!     The batch id the group has committed.  `0` means "nothing yet".  This
+//!     connector takes it from the step the engine passes to `batch_start`.
+//!
+//!     **Unverified, and it matters:** the Python bridge published its egress
+//!     chunk's `processed_steps` here.  If the step the engine hands a native
+//!     output endpoint is a different counter — a per-run transaction number,
+//!     say — then a catalog last written by the Python bridge cannot be adopted
+//!     by a native pipeline: the guard would classify every step as stale and
+//!     hold.  The interop claim above is therefore about the *shape* of the
+//!     protocol (same columns, same decisions), not about two implementations
+//!     sharing one catalog.  Confirming the counters agree is an open question,
+//!     not an assumption this code is entitled to make.
 //!
 //! `generation`
 //!     Identifies the pipeline and SQL program.  A batch from another generation
@@ -32,12 +40,14 @@
 //!   (fencing).
 //!
 //! Where this differs from `protocol.py`, and why: there the frontier was a step
-//! counter that restarted with the bridge process, so a replay could only be
-//! recognised by the batch identity `generation:base->end`.  A DBSP transaction
-//! id is monotone across replay, so `frontier >= end` decides the question
-//! without consulting the identity — and `base` degrades from identity input to
-//! a consistency assertion, which is why a mismatch is stale rather than a
-//! rewrite of history.
+//! counter taken from the egress chunk, so a replay could only be recognised by
+//! the batch identity `generation:base->end`.  If the step this endpoint receives
+//! is monotone across replay, `frontier >= end` decides the question without
+//! consulting the identity — and `base` degrades from identity input to a
+//! consistency assertion, which is why a mismatch is stale rather than a rewrite
+//! of history.  That premise is the open question above, not an established fact,
+//! so the identity check is kept as well: it is what still recognises a replay if
+//! the counters do not line up.
 
 use anyhow::{Result, bail};
 use serde_json::Value;
