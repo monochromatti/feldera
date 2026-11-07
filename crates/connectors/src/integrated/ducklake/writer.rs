@@ -535,7 +535,7 @@ impl Encoder for DuckLakeWriter {
                 return Err(self.fail_and_hold(e));
             }
         };
-                self.pending.deltas.extend(deltas);
+        self.pending.deltas.extend(deltas);
         Ok(())
     }
 }

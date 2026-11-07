@@ -640,7 +640,7 @@ fn duckdb_cli() -> Option<String> {
 /// `Unable to connect to Postgres … database "dl_probe" does not exist`), so the
 /// case creates one through a plain `postgres` connection, exactly as a
 /// deployment would.
-fn postgres_catalog(prefix: &str) -> Option<String> {
+pub(super) fn postgres_catalog(prefix: &str) -> Option<String> {
     let admin = Service::Postgres.address();
     let url = url::Url::parse(&admin).expect("the Postgres service address is a URL");
     let name = format!(
