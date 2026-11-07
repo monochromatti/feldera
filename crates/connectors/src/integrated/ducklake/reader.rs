@@ -11,6 +11,15 @@
 //!    the snapshot number first and the rows second would race a commit into
 //!    either a double count (the rows are in both the snapshot and the feed) or a
 //!    missed row (in neither), and neither is recoverable downstream.
+//!
+//!    Measured, because a transaction that only covers DuckDB's own catalog would
+//!    not be enough: with a PostgreSQL-backed catalog the extension reaches the
+//!    database over its own connection, so the question is whether the snapshot is
+//!    pinned per transaction or per statement.  It is pinned per transaction —
+//!    inside one `BEGIN`, `ducklake_current_snapshot('dl')` returned 26 before and
+//!    after a concurrent two-row commit, and the scan returned 1 row both times
+//!    while a reader in a fresh connection saw 3.  So the argument above holds for
+//!    both catalog backends.
 //! 2. **Follow.** For every newly committed snapshot, ask
 //!    `ducklake_table_changes(alias, schema, table, applied + 1, current)`.  The
 //!    window is inclusive at both ends — reading `(2, 3)` returns snapshot 2's
@@ -118,6 +127,13 @@ const HANDOFF_SLICE: Duration = Duration::from_millis(2);
 /// pipeline is suspended.  Stopping the poll at a bound is free: `state` only
 /// advances for rows that were pushed, so nothing is skipped — it is only read
 /// after the `Queue` that drains the buffer.
+///
+/// The bound is checked between polls, so it is a bound on *unread* commits and
+/// not on memory: the bootstrap materialises the whole table before pushing
+/// anything, and one window of changes is materialised whole by the FFI call that
+/// reads it.  Chunking either would need a cursor inside a snapshot that DuckLake
+/// does not offer; the alternative would be to re-read from the start of the
+/// window, which is worse than the memory.
 const MAX_BUFFERED: usize = 100_000;
 
 /// Where the reader stopped, as stored in a checkpoint.
@@ -132,10 +148,23 @@ pub(super) struct ReaderState {
 }
 
 impl ReaderState {
-    fn from_metadata(metadata: Option<&serde_json::Value>) -> Self {
-        metadata
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default()
+    /// Read the state a checkpoint carried, or fail.
+    ///
+    /// A parse failure used to be discarded with `.ok()`, which turned an
+    /// unreadable checkpoint into `Default` — and `Default` means "never
+    /// bootstrapped", so the whole table was re-read and re-emitted as `+1` on
+    /// top of rows the collection still held.  `COUNT` and `SUM` inflate, nothing
+    /// reports anything, and the damage is upstream of every later step.  A
+    /// checkpoint this connector wrote and cannot read is now an error the
+    /// operator sees, the same way `journal.Checkpoint.from_json` raises rather
+    /// than guessing.
+    pub(super) fn from_metadata(metadata: Option<&serde_json::Value>) -> AnyResult<Self> {
+        let Some(value) = metadata else {
+            return Ok(Self::default());
+        };
+        serde_json::from_value(value.clone()).with_context(|| {
+            format!("the DuckLake input checkpoint is not a reader state: {value}")
+        })
     }
 
     fn to_metadata(self) -> serde_json::Value {
@@ -209,7 +238,7 @@ pub fn open(
         schema: config.catalog.schema.clone(),
         table: config.table.clone(),
     };
-    let state = ReaderState::from_metadata(resume.as_ref());
+    let state = ReaderState::from_metadata(resume.as_ref())?;
     // The interval is the pipeline's decision, so it is read here rather than
     // fixed: a test and a low-latency pipeline want very different values.
     let poll_interval: Duration = config.poll_interval().into();
@@ -326,20 +355,26 @@ impl Table {
 
 /// Hand one row on with the polarity its change type implies.
 pub(super) fn push(
-    sink: &mut dyn FnMut(&str, &str) -> AnyResult<()>,
+    sink: &mut dyn FnMut(&str, bool, &str) -> AnyResult<()>,
     table: &Table,
     change_type: &str,
     json: &str,
 ) -> AnyResult<()> {
-    match change_type {
-        "insert" | "update_postimage" | "delete" | "update_preimage" => sink(change_type, json),
+    // The change type is mapped here and nowhere else.  The sink used to match on
+    // the string too, with everything unrecognised falling into `delete`: two
+    // lists that agreed by luck, and a fifth DuckLake change type would have gone
+    // out as `-1` without a word.
+    let is_insert = match change_type {
+        "insert" | "update_postimage" => true,
+        "delete" | "update_preimage" => false,
         other => bail!(
             "{}.{} changed with change_type {other:?}, which this connector does not know the \
              weight of; refusing to guess",
             table.schema,
             table.table
         ),
-    }
+    };
+    sink(change_type, is_insert, json)
 }
 
 /// Build the JSON projection for a relation.
@@ -462,7 +497,7 @@ impl<'a> ReaderCatalog<'a> {
 pub(super) fn advance(
     catalog: &ReaderCatalog<'_>,
     table: &Table,
-    sink: &mut dyn FnMut(&str, &str) -> AnyResult<()>,
+    sink: &mut dyn FnMut(&str, bool, &str) -> AnyResult<()>,
     state: ReaderState,
 ) -> AnyResult<(ReaderState, usize)> {
     catalog.refresh()?;
@@ -482,7 +517,18 @@ pub(super) fn advance(
                 pushed,
             ));
         }
-        if current <= state.snapshot {
+        if current < state.snapshot {
+            // Following it would emit nothing forever while the pipeline looked
+            // healthy: `changes(snapshot + 1, current)` over an interval that is
+            // now in the past.  A rewind means the catalog was restored or rebuilt
+            // under a checkpoint that describes a different history, and the
+            // reference connector treats it as an error for the same reason.
+            bail!(
+                "the DuckLake catalog is at snapshot {current} but this pipeline had followed it                  to {}; the catalog went backwards, so every later commit would be a diff against                  history this reader never saw. Restore the catalog or recreate the pipeline                  with a new generation.",
+                state.snapshot
+            );
+        }
+        if current == state.snapshot {
             return Ok((state, 0));
         }
         let rows = table
@@ -560,7 +606,7 @@ fn run(
                     // The controller replays from a checkpoint: drop whatever is
                     // buffered, then re-read from the recorded snapshot.
                     stream.truncate(0);
-                    state = ReaderState::from_metadata(Some(&metadata));
+                    state = ReaderState::from_metadata(Some(&metadata))?;
                     if !state.bootstrapped {
                         // A replay of the initial state re-runs the bootstrap.
                         state = ReaderState::default();
@@ -584,9 +630,12 @@ fn run(
         // `state` only advances for rows actually pushed, so the next poll after a
         // `Queue` drains the buffer reads the rest.
         if stream.len().records < MAX_BUFFERED {
-            let mut sink = |change_type: &str, json: &str| match change_type {
-                "insert" | "update_postimage" => stream.insert(json.as_bytes(), &None),
-                _ => stream.delete(json.as_bytes(), &None),
+            let mut sink = |_change_type: &str, is_insert: bool, json: &str| {
+                if is_insert {
+                    stream.insert(json.as_bytes(), &None)
+                } else {
+                    stream.delete(json.as_bytes(), &None)
+                }
             };
             let (next, pushed) = advance(&catalog, &table, &mut sink, state)?;
             if next != state {

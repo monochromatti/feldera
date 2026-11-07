@@ -462,6 +462,70 @@ fn a_null_key_part_is_matched_not_skipped() {
     );
 }
 
+/// A catalog that went backwards must be refused, not followed forever.
+///
+/// `current <= state.snapshot` used to return "no news", so a checkpoint ahead of
+/// a restored or rebuilt catalog left the reader polling a window in the past:
+/// healthy-looking, never emitting, and — had the catalog caught up — diffing
+/// against snapshots it never read.  The reference connector raises for the same
+/// condition (`source/catalog-rewind-is-refused`).
+#[test]
+fn a_catalog_that_went_backwards_is_refused() {
+    let Some(config) = live_config("rewind") else {
+        return;
+    };
+    seed(
+        &config,
+        "CREATE TABLE dl.main.orders (id INT, name VARCHAR)",
+    );
+    let (_, state) = advance_once(&config, ReaderState::default());
+    let ahead = ReaderState {
+        snapshot: state.snapshot + 5,
+        bootstrapped: true,
+    };
+
+    let catalog = ReaderCatalog::attach(&config.catalog).expect("attach the catalog read-only");
+    let table = Table::new(&config.catalog, "main", "orders", &projection()).expect("an address");
+    let mut sink = |_change_type: &str, _is_insert: bool, _json: &str| Ok(());
+    let error = advance(&catalog, &table, &mut sink, ahead)
+        .expect_err("a snapshot ahead of the catalog must not be treated as no news");
+    assert!(
+        error.to_string().contains("went backwards"),
+        "the error must name the cause: {error}"
+    );
+}
+
+/// A checkpoint that does not parse must be an error, not a fresh bootstrap.
+///
+/// `from_metadata` used to swallow the parse error with `.ok()` and return
+/// `Default`, and `Default` means `bootstrapped: false` — so an unreadable
+/// checkpoint re-read the whole table and re-emitted every row as `+1` on top of
+/// the rows the collection still held, inflating `COUNT` and `SUM` with nothing
+/// reported.  A checkpoint written without `bootstrapped` (an older build, a
+/// hand-edited one) is exactly that case.
+#[test]
+fn a_checkpoint_that_does_not_parse_is_refused() {
+    let error = ReaderState::from_metadata(Some(&json!({"snapshot": 7})))
+        .expect_err("a checkpoint missing `bootstrapped` must not be read as Default");
+    assert!(
+        error.to_string().contains("not a reader state"),
+        "the error must name the checkpoint: {error}"
+    );
+    assert_eq!(
+        ReaderState::from_metadata(Some(&json!({"snapshot": 7, "bootstrapped": true})))
+            .expect("a complete checkpoint parses"),
+        ReaderState {
+            snapshot: 7,
+            bootstrapped: true
+        }
+    );
+    assert_eq!(
+        ReaderState::from_metadata(None).expect("no checkpoint is the initial state"),
+        ReaderState::default(),
+        "the first start bootstraps"
+    );
+}
+
 /// Without key columns the table is a bag: a delete removes one copy.
 ///
 /// Removing every matching row would turn a multiset into a set and lose a row
@@ -563,7 +627,14 @@ fn advance_once(
         Table::new(&config.catalog, "main", "orders", &projection).expect("a table address");
     let mut pushed = Vec::new();
     let next = {
-        let mut sink = |change_type: &str, json: &str| {
+        // The label is what the assertions below compare, so the sink records it
+        // and cross-checks the polarity `push` derived from it.
+        let mut sink = |change_type: &str, is_insert: bool, json: &str| {
+            assert_eq!(
+                is_insert,
+                matches!(change_type, "insert" | "update_postimage"),
+                "the derived polarity disagrees with {change_type}"
+            );
             pushed.push((change_type.to_owned(), json.to_owned()));
             Ok(())
         };
