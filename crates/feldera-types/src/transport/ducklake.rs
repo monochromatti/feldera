@@ -151,6 +151,15 @@ pub struct DuckLakeSinkConfig {
     /// then `INSERT`); without them it deletes exactly one matching row and
     /// inserts one, which preserves a bag. Unset keeps the bag semantics, which
     /// is right for every table that is not known to have a key.
+    ///
+    /// **This is a promise about the data, not a hint.** Keyed replacement removes
+    /// at most one row per key, so if the view can produce two rows with the same
+    /// key, the second insert replaces the first and the table ends up holding one
+    /// row where the pipeline emitted two — an undercount the guard cannot see,
+    /// because the guard records that the step was applied, not what it applied.
+    /// The connector cannot check the promise: it would have to read the view's
+    /// distinct-key count, which is unbounded work on every step. Leave this unset
+    /// unless the view is known to be unique on these columns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_columns: Vec<String>,
 }

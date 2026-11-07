@@ -255,11 +255,10 @@ impl DuckLakeWriter {
             // happens when a step's rows cancelled out exactly.
             return;
         }
-        let rows = deltas.len() as u64;
         match self.publish(step, deltas, resync) {
             // Report the frontier of the guard row this publication wrote, not a
             // fresh read: a read that fails must not turn into "frontier 0".
-            Ok(frontier) => self.report_progress(frontier, rows),
+            Ok((frontier, rows)) => self.report_progress(frontier, rows),
             Err(e) => {
                 let refused = self.fail_and_hold(e);
                 // The hold ends only at shutdown, and `batch_end` has no way to
@@ -269,8 +268,10 @@ impl DuckLakeWriter {
             }
         }
     }
-    /// Publish one step and return the frontier the guard row now carries.
-    fn publish(&mut self, step: Step, deltas: Vec<Delta>, resync: bool) -> AnyResult<u64> {
+    /// Publish one step and return the frontier the guard row now carries, plus
+    /// the number of deltas actually written (0 when the step was already
+    /// committed).
+    fn publish(&mut self, step: Step, deltas: Vec<Delta>, resync: bool) -> AnyResult<(u64, u64)> {
         self.ensure_connected()?;
         let catalog = self
             .catalog
@@ -302,6 +303,11 @@ impl DuckLakeWriter {
             resync,
         };
         protocol::validate(&batch, std::slice::from_ref(&target.table))?;
+        // Counted before the publication moves the deltas into the catalog, and
+        // counted in deltas rather than records: a keyed update arrives as two
+        // deltas for one row, and the metric has always counted what was applied,
+        // not what the engine called a record.
+        let deltas_written = batch.deltas.len() as u64;
         // The payload is this endpoint's table only, and a resync deletes only what
         // it then repopulates.  Clearing every configured table here would let a
         // second endpoint's resync wipe the rows a first one just published, with
@@ -320,7 +326,7 @@ impl DuckLakeWriter {
                     batch.deltas.len(),
                     result.attempts
                 );
-                Ok(result.guard.frontier)
+                Ok((result.guard.frontier, deltas_written))
             }
             protocol::Decision::Duplicate => {
                 tracing::info!(
@@ -328,7 +334,10 @@ impl DuckLakeWriter {
                     self.endpoint_name,
                     batch.batch_id()
                 );
-                Ok(result.guard.frontier)
+                // Nothing was written, so the progress metric must not claim it
+                // was: a duplicate is exactly what a restart produces in bulk, and
+                // a nonzero count there reads as a working writer that did work.
+                Ok((result.guard.frontier, 0))
             }
             other => {
                 // A frontier ahead of this batch is the one situation an operator
@@ -468,6 +477,15 @@ impl OutputConsumer for DuckLakeWriter {
 
     fn batch_start(&mut self, step: Step, batch_type: OutputBatchType) {
         self.records_written.store(0, Ordering::Relaxed);
+        // A refusal is not recoverable, and a step that arrives after one must not
+        // look like a success.  `encode` refuses work, but a step can be started and
+        // ended with no `encode` at all — `publish_pending` sees no deltas, treats
+        // the step as one whose rows cancelled out, and returns cleanly, so a poisoned
+        // writer would report a good `batch_end`.
+        if self.poisoned.is_some() {
+            self.pending.step = None;
+            return;
+        }
         let resync = match batch_type {
             OutputBatchType::Snapshot => {
                 // The engine is starting over: it sends the whole content rather
