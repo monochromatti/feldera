@@ -526,9 +526,6 @@ impl Encoder for DuckLakeWriter {
                 // Drop the step first: a snapshot batch has already set
                 // `pending.resync`, and publishing it with no rows would delete the
                 // endpoint's table and advance the guard over the hole.
-                // Drop the step first: a snapshot batch has already set
-                // `pending.resync`, and publishing it with no rows would delete the
-                // endpoint's table and advance the guard over the hole.
                 self.pending.step = None;
                 // Return the error after the hold, so the failure is not reported as
                 // a successful step once shutdown ends the hold.
