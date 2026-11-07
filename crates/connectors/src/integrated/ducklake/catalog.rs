@@ -87,13 +87,14 @@ pub fn quote_ident(ident: &str) -> Result<String> {
 pub struct Catalog {
     #[allow(dead_code)] // the library stays loaded for the catalog's lifetime
     lib: &'static Library,
-    /// Owns the DuckDB database handle.  Never read after `open`.  Declared
-    /// **after** `conn` on purpose: fields are dropped in declaration order, and
-    /// `duckdb_close` requires every connection to be closed first — with this
-    /// last, `duckdb_disconnect` runs before the database is closed.
+    /// The connection.  Declared **before** `db` on purpose: fields are dropped in
+    /// declaration order, and `duckdb_close` requires every connection to be closed
+    /// first — with `conn` first, `duckdb_disconnect` runs before the database is
+    /// closed.
+    conn: Conn<'static>,
+    /// Owns the DuckDB database handle.  Never read after `open`.
     #[allow(dead_code)]
     db: Db<'static>,
-    conn: Conn<'static>,
     alias: String,
     schema: String,
     guard_table: String,

@@ -84,6 +84,10 @@ pub struct DuckLakeWriter {
 
     /// The batch in flight: what `batch_start` declared and `encode` filled.
     pending: Pending,
+
+    /// Set when a step was refused.  A refused step must not be followed by a
+    /// successful call, or the controller can count it as processed.
+    poisoned: Option<String>,
 }
 
 /// The DuckLake table one endpoint writes.
@@ -159,6 +163,7 @@ impl DuckLakeWriter {
             target: None,
             callbacks: None,
             pending: Pending::default(),
+            poisoned: None,
         })
     }
 
@@ -245,10 +250,15 @@ impl DuckLakeWriter {
             // Report the frontier of the guard row this publication wrote, not a
             // fresh read: a read that fails must not turn into "frontier 0".
             Ok(frontier) => self.report_progress(frontier, rows),
-            Err(e) => self.fail_and_hold(e),
+            Err(e) => {
+                let refused = self.fail_and_hold(e);
+                // The hold ends only at shutdown, and `batch_end` has no way to
+                // report failure, so the refusal has to surface on the next call
+                // the engine makes — see `poisoned` and `encode`.
+                self.poisoned = Some(format!("{refused:#}"));
+            }
         }
     }
-
     /// Publish one step and return the frontier the guard row now carries.
     fn publish(&mut self, step: Step, deltas: Vec<Delta>, resync: bool) -> AnyResult<u64> {
         self.ensure_connected()?;
@@ -333,8 +343,12 @@ impl DuckLakeWriter {
     /// Report a failure and hold the output thread until shutdown.
     ///
     /// See the module notes: returning here would let the engine treat a step
-    /// whose output is not in the catalog as processed.
-    fn fail_and_hold(&mut self, error: anyhow::Error) {
+    /// whose output is not in the catalog as processed.  Holding alone is not
+    /// enough, though — shutdown cancels the hold, so the error is returned too:
+    /// a caller that reports success after a refused publication hands the
+    /// controller exactly the "processed but never committed" step this module
+    /// exists to prevent.
+    fn fail_and_hold(&mut self, error: anyhow::Error) -> anyhow::Error {
         let detail = format!("{error:#}");
         tracing::error!(
             "ducklake: {} failed to publish: {detail}",
@@ -353,6 +367,7 @@ impl DuckLakeWriter {
         while !self.shutdown.is_cancelled() {
             std::thread::sleep(HOLD_POLL);
         }
+        error
     }
 
     fn report_progress(&self, frontier: u64, rows: u64) {
@@ -435,6 +450,14 @@ impl OutputConsumer for DuckLakeWriter {
                 // fail than have its tables rewritten, so this is where that promise
                 // is kept — until now the flag was accepted and never read.
                 if !self.config.send_snapshot {
+                    // Clear the step in flight: the hold runs while the engine keeps
+                    // calling the encoder, and a stale step would attribute this
+                    // snapshot's rows to the previous step's identity.
+                    self.pending.step = None;
+                    self.poisoned = Some(format!(
+                        "the engine sent a snapshot for {} but `send_snapshot` is false",
+                        self.endpoint_name
+                    ));
                     self.fail_and_hold(anyhow!(
                         "the engine sent a snapshot for {} but `send_snapshot` is false; \
                          the catalog was not rewritten",
@@ -478,6 +501,12 @@ impl Encoder for DuckLakeWriter {
     }
 
     fn encode(&mut self, batch: Arc<dyn SerBatchReader>) -> AnyResult<()> {
+        // A refused step is not republishable: say so rather than accepting work
+        // that can never be published behind it.
+        if let Some(refused) = &self.poisoned {
+            bail!("the DuckLake writer refused an earlier step and accepts no more: {refused}");
+        }
+
         // A step whose rows cancel out arrives with content that nets to
         // nothing; publishing it would still advance the frontier, which is
         // correct, so the deltas are collected even when they are empty.
@@ -497,12 +526,16 @@ impl Encoder for DuckLakeWriter {
                 // Drop the step first: a snapshot batch has already set
                 // `pending.resync`, and publishing it with no rows would delete the
                 // endpoint's table and advance the guard over the hole.
+                // Drop the step first: a snapshot batch has already set
+                // `pending.resync`, and publishing it with no rows would delete the
+                // endpoint's table and advance the guard over the hole.
                 self.pending.step = None;
-                self.fail_and_hold(e);
-                return Ok(());
+                // Return the error after the hold, so the failure is not reported as
+                // a successful step once shutdown ends the hold.
+                return Err(self.fail_and_hold(e));
             }
         };
-        self.pending.deltas = deltas;
+                self.pending.deltas.extend(deltas);
         Ok(())
     }
 }
@@ -534,8 +567,10 @@ impl OutputEndpoint for DuckLakeWriter {
     fn is_fault_tolerant(&self) -> bool {
         // A step whose identity the guard row already holds is a no-op, so
         // replaying it cannot duplicate it.  That is what makes at-least-once
-        // delivery safe here, and it is why the guard row exists.
-        true
+        // delivery safe here, and it is why the guard row exists.  A refused step
+        // is the one thing that is *not* safe to checkpoint, so poisoning the
+        // writer withdraws the claim.
+        self.poisoned.is_none()
     }
 }
 

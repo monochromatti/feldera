@@ -244,7 +244,9 @@ pub fn decide(guard: &Guard, batch: &Batch) -> Result<Decision> {
         // not a step in a sequence: it is the whole content as of `end`.  A
         // restart renumbers steps, so its first snapshot can arrive with an `end`
         // far behind the guard's frontier, and refusing that would wedge the one
-        // path that recovers.
+        // path that recovers.  The consequence — `advance` then records an `end`
+        // below the current frontier, moving it backwards — is pinned by
+        // `a_resync_behind_the_frontier_moves_the_frontier_back`.
         if batch.resync {
             return Ok(Decision::Apply);
         }
@@ -415,6 +417,26 @@ mod tests {
         let mut resync = batch("gen", 1, 0, 12);
         resync.resync = true;
         assert_eq!(decided(&guard(5), &resync), Decision::Apply);
+    }
+
+    #[test]
+    fn a_resync_behind_the_frontier_moves_the_frontier_back() {
+        // Deliberate, and worth pinning because it looks like a bug: a restart
+        // renumbers steps, so a snapshot can arrive with an `end` the guard has
+        // already passed.  `advance` records the batch's `end` unconditionally —
+        // the frontier is where the content *is*, not the highest number ever
+        // seen — so it moves backwards, and the steps in between stay replayable.
+        // That is safe only because a resync replaces the whole content of its
+        // group, which is what makes re-applying one of those steps add rows to a
+        // table the snapshot has already rewritten rather than resurrect lost
+        // ones.
+        let mut resync = batch("gen", 1, 0, 3);
+        resync.resync = true;
+        let moved = advance(&guard(10), &resync);
+        assert_eq!(moved.frontier, 3);
+        // The step that the regressed frontier now admits applies again; the
+        // guard no longer recognises it as published.
+        assert_eq!(decided(&moved, &batch("gen", 1, 3, 4)), Decision::Apply);
     }
 
     #[test]
