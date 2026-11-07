@@ -27,7 +27,6 @@
 //! They skip themselves with a printed reason when no server answers.
 
 use std::collections::BTreeMap;
-use std::sync::Barrier;
 
 use feldera_types::transport::ducklake::{
     DEFAULT_ALIAS, DEFAULT_GUARD_TABLE, DEFAULT_SCHEMA, DuckLakeCatalogConfig, DuckLakeSinkConfig,
@@ -1091,7 +1090,16 @@ fn the_loop_bootstraps_once_and_replays_from_the_checkpoint_it_reported() {
 /// nothing else the concurrency cases care about; going through JSON like the
 /// engine tests do would add a `DuckLakeWriterConfig` round-trip whose failure
 /// mode ("a field the test forgot") is the same one the types already prevent.
-fn postgres_group_config(dsn: &str, data: &str, group: &str, table: &str) -> DuckLakeWriterConfig {
+///
+/// `tables` is a list because the resync case needs a group configured with two
+/// tables: a resync's scope is only observable when the configured set is wider
+/// than the set the batch carries.
+fn postgres_group_config(
+    dsn: &str,
+    data: &str,
+    group: &str,
+    tables: &[&str],
+) -> DuckLakeWriterConfig {
     DuckLakeWriterConfig {
         catalog: DuckLakeCatalogConfig {
             catalog: dsn.to_owned(),
@@ -1104,13 +1112,18 @@ fn postgres_group_config(dsn: &str, data: &str, group: &str, table: &str) -> Duc
         output_group: group.to_owned(),
         generation: "gen-1".to_owned(),
         guard_table: DEFAULT_GUARD_TABLE.to_owned(),
-        tables: BTreeMap::from([(
-            table.to_owned(),
-            DuckLakeSinkConfig {
-                table: table.to_owned(),
-                key_columns: vec![],
-            },
-        )]),
+        tables: tables
+            .iter()
+            .map(|table| {
+                (
+                    (*table).to_owned(),
+                    DuckLakeSinkConfig {
+                        table: (*table).to_owned(),
+                        key_columns: vec![],
+                    },
+                )
+            })
+            .collect(),
         epoch: None,
         send_snapshot: true,
     }
@@ -1137,6 +1150,47 @@ fn appended(catalog: &Catalog, group: &str, table: &str, base: u64, rows: u64) -
     }
 }
 
+/// A workshold under `TempDir` for one case's data files, and the catalog
+/// environment the live cases need.  `None` means "skip, and say why".
+fn postgres_or_skip(name: &str) -> Option<(String, tempfile::TempDir)> {
+    let Some(dsn) = super::test::postgres_catalog(name) else {
+        eprintln!(
+            "skipping {name}: no PostgreSQL server answers at {}",
+            crate::test::Service::Postgres.address()
+        );
+        return None;
+    };
+    if std::env::var_os("DUCKLAKE_DUCKDB_LIB").is_none()
+        || std::env::var_os("DUCKLAKE_EXTENSION_DIR").is_none()
+    {
+        eprintln!(
+            "[skipped] {name}: set DUCKLAKE_DUCKDB_LIB and DUCKLAKE_EXTENSION_DIR to run the live cases"
+        );
+        return None;
+    }
+    let dir = tempfile::TempDir::new().expect("a temp directory");
+    std::fs::create_dir_all(dir.path().join("data")).expect("create the data directory");
+    Some((dsn, dir))
+}
+
+/// Two group threads rendezvous through a channel each, so that a thread that
+/// panics fails the case instead of hanging it.
+///
+/// `std::sync::Barrier` was the obvious choice and is the wrong one: a worker that
+/// panics at the rendezvous — or before reaching it — leaves its peer blocked
+/// forever, and libtest has no timeout, so a broken test hangs the suite rather
+/// than failing it. `recv_timeout` turns that into a failure with a message.
+fn rendezvous(
+    send: &std::sync::mpsc::SyncSender<()>,
+    recv: &std::sync::mpsc::Receiver<()>,
+    who: &str,
+) {
+    send.send(())
+        .expect("the rendezvous sender outlives the loop");
+    recv.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("{who}: the other group never reached the rendezvous"));
+}
+
 /// Two output groups committing into one PostgreSQL catalog at the same time must
 /// each see exactly their own rows, and each must apply its step exactly once.
 ///
@@ -1149,36 +1203,24 @@ fn appended(catalog: &Catalog, group: &str, table: &str, base: u64, rows: u64) -
 /// stale guard and answered `Duplicate`) or a doubled one (the retry re-applied a
 /// batch that had in fact landed).
 ///
-/// The two threads rendezvous before every `publish`, not just once before the
-/// loop: the conflict is between two commits, so the attempts have to start
-/// together. How many of them actually conflict is DuckLake's business, so the
-/// retry count is printed rather than asserted (`--nocapture`); the assertions
-/// are on the outcome, which must be the same either way.
+/// The threads rendezvous before **every** `publish` they have in common, not just
+/// once before the loop, because the conflict is between two commits: attempts
+/// that start apart may not overlap at all. The group that runs longer then
+/// continues alone, which is deliberate — it leaves the two guards at *different*
+/// frontiers, so the re-attachment at the end can tell "read group A's guard" from
+/// "read the maximum of the two".
 #[test]
 fn two_groups_commit_concurrently_into_one_catalog() {
-    let Some(dsn) = super::test::postgres_catalog("ducklake_concurrent") else {
-        eprintln!(
-            "skipping two_groups_commit_concurrently_into_one_catalog: no PostgreSQL server answers at {}",
-            crate::test::Service::Postgres.address()
-        );
+    let Some((dsn, dir)) = postgres_or_skip("two_groups_commit_concurrently_into_one_catalog")
+    else {
         return;
     };
-    if std::env::var_os("DUCKLAKE_DUCKDB_LIB").is_none()
-        || std::env::var_os("DUCKLAKE_EXTENSION_DIR").is_none()
-    {
-        eprintln!(
-            "[skipped] two_groups_commit_concurrently_into_one_catalog: set DUCKLAKE_DUCKDB_LIB and DUCKLAKE_EXTENSION_DIR"
-        );
-        return;
-    }
-    let data = tempfile::TempDir::new().expect("a temp directory");
-    let data = data.path().join("data").display().to_string();
-    std::fs::create_dir_all(&data).expect("create the data directory");
+    let data = dir.path().join("data").display().to_string();
     let suffix = std::process::id();
     let (group_a, table_a) = (format!("ga{suffix}"), format!("ta{suffix}"));
     let (group_b, table_b) = (format!("gb{suffix}"), format!("tb{suffix}"));
-    let cfg_a = postgres_group_config(&dsn, &data, &group_a, &table_a);
-    let cfg_b = postgres_group_config(&dsn, &data, &group_b, &table_b);
+    let cfg_a = postgres_group_config(&dsn, &data, &group_a, &[&table_a]);
+    let cfg_b = postgres_group_config(&dsn, &data, &group_b, &[&table_b]);
 
     for (cfg, table) in [(&cfg_a, &table_a), (&cfg_b, &table_b)] {
         let mut catalog = Catalog::open(cfg).expect("attach the shared catalog");
@@ -1189,132 +1231,203 @@ fn two_groups_commit_concurrently_into_one_catalog() {
             .expect("create the group's table");
     }
 
-    const STEPS: u64 = 6;
+    // A stops after `SHARED`, B carries on to `STEPS_A + 1`, so the guards differ.
+    const SHARED: u64 = 4;
+    const STEPS_A: u64 = SHARED;
+    const STEPS_B: u64 = STEPS_A + 2;
     const ROWS: u64 = 3;
-    use std::sync::Arc;
-
-    let barrier = Arc::new(Barrier::new(2));
-    let run = |cfg: DuckLakeWriterConfig, table: String, group: String| {
-        let barrier = Arc::clone(&barrier);
+    let (tx_a, rx_a) = std::sync::mpsc::sync_channel::<()>(1);
+    let (tx_b, rx_b) = std::sync::mpsc::sync_channel::<()>(1);
+    let run = |cfg: DuckLakeWriterConfig,
+               table: String,
+               group: String,
+               steps: u64,
+               send: std::sync::mpsc::SyncSender<()>,
+               recv: std::sync::mpsc::Receiver<()>| {
         std::thread::spawn(move || {
             let mut catalog = Catalog::open(&cfg).expect("attach for the group");
-            let (mut applied, mut retried) = (0, 0);
-            for step in 0..STEPS {
+            let (mut applied, mut retried, mut refused) = (0, 0, 0);
+            for step in 0..steps {
                 let batch = appended(&catalog, &group, &table, step, ROWS);
-                barrier.wait();
+                if step < SHARED {
+                    rendezvous(&send, &recv, &group);
+                }
                 let result = catalog
-                    .publish(&batch, Some(std::slice::from_ref(&table)), 32)
+                    .publish(
+                        &batch,
+                        Some(std::slice::from_ref(&table)),
+                        super::writer::MAX_ATTEMPTS,
+                    )
                     .unwrap_or_else(|e| panic!("{group} step {step}: {e:#}"));
-                if result.decision == Decision::Apply {
-                    applied += 1;
+                match result.decision {
+                    // A duplicate is a success: it means the step is committed.
+                    Decision::Apply => applied += 1,
+                    Decision::Duplicate => applied += 1,
+                    Decision::Stale | Decision::WrongGeneration | Decision::WrongOwner => {
+                        refused += 1
+                    }
                 }
                 if result.attempts > 1 {
                     retried += 1;
                 }
             }
-            (catalog, applied, retried)
+            (catalog, applied, retried, refused)
         })
     };
-    let a = run(cfg_a, table_a.clone(), group_a.clone());
-    let b = run(cfg_b, table_b.clone(), group_b.clone());
-    let (mut catalog_a, applied_a, retried_a) = a.join().expect("group A's thread");
-    let (mut catalog_b, applied_b, retried_b) = b.join().expect("group B's thread");
+    let a = run(cfg_a, table_a.clone(), group_a.clone(), STEPS_A, tx_a, rx_b);
+    let b = run(cfg_b, table_b.clone(), group_b.clone(), STEPS_B, tx_b, rx_a);
+    let (mut catalog_a, applied_a, retried_a, refused_a) = a.join().expect("group A's thread");
+    let (mut catalog_b, applied_b, retried_b, refused_b) = b.join().expect("group B's thread");
 
-    eprintln!("[pg] retried steps: A {retried_a}, B {retried_b} of {STEPS}");
-    assert_eq!(applied_a, STEPS, "group A applied every step exactly once");
-    assert_eq!(applied_b, STEPS, "group B applied every step exactly once");
+    eprintln!("[pg] retried steps: A {retried_a} of {STEPS_A}, B {retried_b} of {STEPS_B}");
+    assert_eq!(refused_a + refused_b, 0, "a refusal is a lost step");
+    assert_eq!(applied_a, STEPS_A, "group A committed every step once");
+    assert_eq!(applied_b, STEPS_B, "group B committed every step once");
+    // Asserted, not just printed: this case exists to run the retry path, and a
+    // run where the two writers never conflicted has not run it. What is *not*
+    // asserted is how many conflicts there are — that is DuckLake's business.
+    assert!(
+        retried_a + retried_b >= 1,
+        "no commit conflicted, so the retry path never ran (A {retried_a}, B {retried_b})"
+    );
 
-    for (catalog, table) in [(&mut catalog_a, &table_a), (&mut catalog_b, &table_b)] {
+    for (catalog, table, steps) in [
+        (&mut catalog_a, &table_a, STEPS_A),
+        (&mut catalog_b, &table_b, STEPS_B),
+    ] {
+        // Filtered by `name` rather than counted outright: the two groups write
+        // identically shaped rows, so a row that landed in the wrong table would
+        // still be counted by a bare `count(*)`.
         assert_eq!(
             catalog
-                .scalar(&format!("SELECT count(*) FROM dl.{table}"))
-                .expect("count the group's rows")
+                .scalar(&format!(
+                    "SELECT count(*) FROM dl.{table} WHERE name = '{table}'"
+                ))
+                .expect("count the group's own rows")
                 .as_deref(),
-            Some((STEPS * ROWS).to_string().as_str()),
-            "{table} holds its own group's rows and nobody else's"
+            Some((steps * ROWS).to_string().as_str()),
+            "{table} holds its own group's rows"
         );
-    }
-    for (catalog, group) in [(&mut catalog_a, &group_a), (&mut catalog_b, &group_b)] {
+        assert_eq!(
+            catalog
+                .scalar(&format!(
+                    "SELECT count(*) FROM dl.{table} WHERE name <> '{table}'"
+                ))
+                .expect("count the foreign rows")
+                .as_deref(),
+            Some("0"),
+            "{table} holds nobody else's rows"
+        );
         assert_eq!(
             catalog.frontier().expect("the group's guard"),
-            STEPS,
-            "{group}'s guard is at its last step"
+            steps,
+            "{table}'s guard is at its own last step"
         );
     }
 
-    // The guard is keyed by group, so a third attachment publishing group A must
-    // read A's frontier, not the maximum of the two.
-    let other = Catalog::open(&postgres_group_config(&dsn, &data, &group_a, &table_a))
+    // The guard is keyed by group, so a new attachment for group A must read A's
+    // frontier. The two frontiers differ, so reading `max` or B's row instead
+    // would be visible.
+    let other = Catalog::open(&postgres_group_config(&dsn, &data, &group_a, &[&table_a]))
         .expect("reattach the catalog");
     assert_eq!(
         other
             .frontier()
             .expect("group A's guard from a new connection"),
-        STEPS
+        STEPS_A,
+        "a fresh attachment reads group A's guard, not the other group's"
     );
 }
 
-/// A resync must clear only the table it publishes, in a catalog another group is
-/// also writing.
+/// A resync must clear only the tables the batch carries, not every table the
+/// group is configured with.
 ///
-/// The failure this prevents is a resync scoped to every table the connector is
-/// configured with rather than to the one the batch carries: with two groups in
-/// one catalog, one group's resync would delete the other's rows while both
-/// guards advanced past them, so nothing would ever restore them. A file catalog
-/// hides it, because a single attachment is also a single configured set.
+/// This is the §18 defect in the configuration where it can actually happen. The
+/// writer assembles one endpoint's batch and commits it alone, so the endpoint's
+/// *configured* set can be wider than what the batch writes; a resync scoped to
+/// the configured set then deletes rows it does not repopulate, and advances the
+/// guard past the hole. With one table per group — what every file-backed case
+/// has — the two scopes coincide and the defect is invisible, which is why this
+/// case configures the group with two tables.
 #[test]
 fn a_resync_clears_only_its_own_group() {
-    let Some(dsn) = super::test::postgres_catalog("ducklake_resync_scope") else {
-        eprintln!(
-            "skipping a_resync_clears_only_its_own_group: no PostgreSQL server answers at {}",
-            crate::test::Service::Postgres.address()
-        );
+    let Some((dsn, dir)) = postgres_or_skip("a_resync_clears_only_its_own_group") else {
         return;
     };
-    if std::env::var_os("DUCKLAKE_DUCKDB_LIB").is_none()
-        || std::env::var_os("DUCKLAKE_EXTENSION_DIR").is_none()
-    {
-        eprintln!(
-            "[skipped] a_resync_clears_only_its_own_group: set DUCKLAKE_DUCKDB_LIB and DUCKLAKE_EXTENSION_DIR"
-        );
-        return;
-    }
-    let data = tempfile::TempDir::new().expect("a temp directory");
-    let data = data.path().join("data").display().to_string();
-    std::fs::create_dir_all(&data).expect("create the data directory");
+    let data = dir.path().join("data").display().to_string();
     let suffix = std::process::id();
     let (group_a, table_a) = (format!("ra{suffix}"), format!("rat{suffix}"));
-    let (group_b, table_b) = (format!("rb{suffix}"), format!("rbt{suffix}"));
+    let (group_b, keep_b, table_b) = (
+        format!("rb{suffix}"),
+        format!("rbk{suffix}"),
+        format!("rbt{suffix}"),
+    );
 
-    for (group, table) in [(&group_a, &table_a), (&group_b, &table_b)] {
-        let mut catalog = Catalog::open(&postgres_group_config(&dsn, &data, group, table))
-            .expect("attach the shared catalog");
-        catalog
-            .execute_sql(&format!(
-                "CREATE TABLE dl.{table} (id BIGINT, name VARCHAR)"
-            ))
-            .expect("create the group's table");
-    }
-    let mut catalog_a = Catalog::open(&postgres_group_config(&dsn, &data, &group_a, &table_a))
-        .expect("attach group A");
-    let mut catalog_b = Catalog::open(&postgres_group_config(&dsn, &data, &group_b, &table_b))
-        .expect("attach group B");
-
-    for (catalog, group, table) in [
-        (&mut catalog_a, &group_a, &table_a),
-        (&mut catalog_b, &group_b, &table_b),
+    for (group, tables) in [
+        (&group_a, vec![table_a.as_str()]),
+        (&group_b, vec![table_b.as_str(), keep_b.as_str()]),
     ] {
-        let first = appended(catalog, group, table, 0, 2);
-        assert_eq!(
+        let mut catalog = Catalog::open(&postgres_group_config(&dsn, &data, group, &tables))
+            .expect("attach the shared catalog");
+        for table in tables {
             catalog
-                .publish(&first, Some(std::slice::from_ref(table)), 8)
-                .expect("the append")
-                .decision,
-            Decision::Apply
-        );
+                .execute_sql(&format!(
+                    "CREATE TABLE dl.{table} (id BIGINT, name VARCHAR)"
+                ))
+                .expect("create the table");
+        }
     }
+    let mut catalog_a = Catalog::open(&postgres_group_config(&dsn, &data, &group_a, &[&table_a]))
+        .expect("attach group A");
+    // Group B is configured with two tables, and both hold rows before the resync.
+    let mut catalog_b = Catalog::open(&postgres_group_config(
+        &dsn,
+        &data,
+        &group_b,
+        &[&table_b, &keep_b],
+    ))
+    .expect("attach group B");
 
-    // Group B resyncs to a single row; group A's two rows must survive.
+    let append_a = appended(&catalog_a, &group_a, &table_a, 0, 2);
+    assert_eq!(
+        catalog_a
+            .publish(
+                &append_a,
+                Some(std::slice::from_ref(&table_a)),
+                super::writer::MAX_ATTEMPTS
+            )
+            .expect("group A's append")
+            .decision,
+        Decision::Apply
+    );
+    let append_b = appended(&catalog_b, &group_b, &table_b, 0, 2);
+    assert_eq!(
+        catalog_b
+            .publish(
+                &append_b,
+                Some(std::slice::from_ref(&table_b)),
+                super::writer::MAX_ATTEMPTS
+            )
+            .expect("group B's append")
+            .decision,
+        Decision::Apply
+    );
+    let seed_keep = appended(&catalog_b, &group_b, &keep_b, 1, 2);
+    assert_eq!(
+        catalog_b
+            .publish(
+                &seed_keep,
+                Some(std::slice::from_ref(&keep_b)),
+                super::writer::MAX_ATTEMPTS
+            )
+            .expect("group B's second table")
+            .decision,
+        Decision::Apply
+    );
+
+    // Group B resyncs `table_b` only — exactly what the writer passes. If the
+    // catalog widened that to the configured set, `keep_b` would be emptied and
+    // the guard would advance over the hole.
     let resync = Batch {
         resync: true,
         deltas: vec![Delta::new(
@@ -1322,32 +1435,49 @@ fn a_resync_clears_only_its_own_group() {
             Op::Insert,
             json!({"id": 900, "name": &table_b}),
         )],
-        ..appended(&catalog_b, &group_b, &table_b, 1, 0)
+        ..appended(&catalog_b, &group_b, &table_b, 2, 0)
     };
     assert_eq!(
         catalog_b
-            .publish(&resync, Some(std::slice::from_ref(&table_b)), 8)
+            .publish(
+                &resync,
+                Some(std::slice::from_ref(&table_b)),
+                super::writer::MAX_ATTEMPTS
+            )
             .expect("the resync")
             .decision,
         Decision::Apply
     );
 
-    for (catalog, table, expected) in [
-        (&mut catalog_a, &table_a, "2"),
-        (&mut catalog_b, &table_b, "1"),
-    ] {
-        assert_eq!(
-            catalog
-                .scalar(&format!("SELECT count(*) FROM dl.{table}"))
-                .expect("count the rows")
-                .as_deref(),
-            Some(expected),
-            "{table} holds what its own group published"
-        );
-    }
+    let count = |catalog: &mut Catalog, table: &str| {
+        catalog
+            .scalar(&format!("SELECT count(*) FROM dl.{table}"))
+            .expect("count the rows")
+            .expect("a row count")
+    };
+    assert_eq!(
+        count(&mut catalog_a, &table_a),
+        "2",
+        "group A keeps its rows"
+    );
+    assert_eq!(
+        count(&mut catalog_b, &table_b),
+        "1",
+        "the resynced table holds the resync's single row"
+    );
+    assert_eq!(
+        count(&mut catalog_b, &keep_b),
+        "2",
+        "the table the resync did not carry keeps its rows"
+    );
     assert_eq!(
         catalog_a.frontier().expect("group A's guard"),
         1,
         "group A's guard is where its own step left it"
+    );
+    assert_eq!(
+        catalog_b.frontier().expect("group B's guard"),
+        3,
+        "group B's guard reached its resync"
     );
 }

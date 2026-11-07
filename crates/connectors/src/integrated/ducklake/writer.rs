@@ -425,7 +425,7 @@ impl DuckLakeWriter {
 /// A conflict means another publisher committed between our read and our
 /// commit; that is a race the retry resolves, not an error, but a persistent
 /// conflict is a real problem and must not spin forever.
-const MAX_ATTEMPTS: usize = 8;
+pub(super) const MAX_ATTEMPTS: usize = 8;
 
 /// How often the failure path checks for shutdown while it holds the thread.
 const HOLD_POLL: Duration = Duration::from_millis(200);
