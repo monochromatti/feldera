@@ -402,6 +402,66 @@ fn a_keyed_update_leaves_the_post_image() {
     );
 }
 
+/// A NULL key part must be matched, not skipped.
+///
+/// `=` never matches NULL, so a delete-by-key written with `=` deletes nothing
+/// for such a row, and the insert that follows leaves two rows where the
+/// pipeline said one — with the guard advanced past both.  The Python reference
+/// was fixed for the same reason and is pinned by
+/// `guard/keyed-replacement-matches-a-null-key` in `scenarios.py`.
+#[test]
+fn a_null_key_part_is_matched_not_skipped() {
+    let Some(mut config) = live_config("null_key") else {
+        return;
+    };
+    for sink in config.tables.values_mut() {
+        sink.key_columns = vec!["id".to_owned()];
+    }
+    let mut catalog = Catalog::open(&config).expect("attach a fresh catalog");
+    catalog
+        .execute_sql("CREATE TABLE dl.orders (id INT, name VARCHAR)")
+        .expect("create the sink table");
+
+    let first = step(
+        &catalog,
+        0,
+        1,
+        vec![Delta::new(
+            "orders",
+            Op::Insert,
+            json!({"id": null, "name": "a"}),
+        )],
+    );
+    catalog
+        .publish(&first, None, 8)
+        .expect("the first publication");
+
+    let update = step(
+        &catalog,
+        1,
+        2,
+        vec![
+            Delta::new("orders", Op::Delete, json!({"id": null, "name": "a"})),
+            Delta::new("orders", Op::Insert, json!({"id": null, "name": "b"})),
+        ],
+    );
+    catalog.publish(&update, None, 8).expect("the update");
+    // Counted through `scalar` rather than `rows`: what a NULL renders as in a
+    // pipe-joined row is a detail of the formatter, and the failure this guards
+    // against is a duplicate row, not a rendering.
+    assert_eq!(
+        catalog.scalar("SELECT count(*) FROM dl.orders").unwrap(),
+        Some("1".to_owned()),
+        "a NULL-keyed update must replace the row, not sit next to it"
+    );
+    assert_eq!(
+        catalog
+            .scalar("SELECT name FROM dl.orders WHERE id IS NULL")
+            .unwrap(),
+        Some("b".to_owned())
+    );
+}
+
 /// Without key columns the table is a bag: a delete removes one copy.
 ///
 /// Removing every matching row would turn a multiset into a set and lose a row
