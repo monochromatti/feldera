@@ -29,10 +29,11 @@
 //!
 //! # State of this module
 //!
-//! Stage B — the writer.  The reader (Stage C) is still a skeleton that fails
-//! rather than silently succeeding: it bootstraps from a snapshot and then polls
-//! the change feed for `start_snapshot + 1 ..= end_snapshot`, and until it does,
-//! a pipeline configured with it must not report a healthy, empty source.
+//! Both stages are implemented: the writer (`writer.rs`), which publishes one step per
+//! transaction under a guard row, and the reader (`reader.rs`), which bootstraps from
+//! a snapshot, then polls the change feed for `start_snapshot + 1 ..= end_snapshot`.
+//! The module note above used to describe the reader as a skeleton that fails rather
+//! than silently succeeding, which stopped being true when it was written.
 //!
 //! # Deployment
 //!

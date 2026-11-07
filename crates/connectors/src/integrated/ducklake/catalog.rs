@@ -83,6 +83,35 @@ pub fn quote_ident(ident: &str) -> Result<String> {
     Ok(format!("\"{ident}\""))
 }
 
+/// An `ATTACH` string with any `password=` value replaced by `***`.
+///
+/// The catalog string is an `ATTACH` statement and may carry credentials —
+/// `ducklake:postgres:dbname=d user=u password=…` is the documented form.  It is
+/// logged at startup and echoed in error contexts, and a pipeline log or status API
+/// that prints a password is a leak the connector would otherwise introduce: nothing
+/// upstream redacts a free-form string.  Every place that formats the string goes
+/// through here.
+pub fn redact_catalog(attach: &str) -> String {
+    let mut out = String::with_capacity(attach.len());
+    let mut rest = attach;
+    loop {
+        let Some(at) = rest.to_ascii_lowercase().find("password=") else {
+            out.push_str(rest);
+            return out;
+        };
+        // Keep everything up to and including `password=`, drop the value.
+        out.push_str(&rest[..at + "password=".len()]);
+        out.push_str("***");
+        // The value runs to the next separator: whitespace, `;`, or the closing quote
+        // of the connection string that carries it.
+        let value = &rest[at + "password=".len()..];
+        let end = value
+            .find(|c: char| c.is_whitespace() || c == ';' || c == '\'')
+            .unwrap_or(value.len());
+        rest = &value[end..];
+    }
+}
+
 /// A DuckLake catalog plus the publication protocol over it.
 pub struct Catalog {
     #[allow(dead_code)] // the library stays loaded for the catalog's lifetime
@@ -799,5 +828,31 @@ mod tests {
         assert!(!is_transaction_conflict(
             "Catalog Error: Table with name x does not exist"
         ));
+    }
+
+    #[test]
+    fn a_catalog_password_never_reaches_a_log_or_an_error() {
+        // The ATTACH string carries credentials and is logged at startup and
+        // echoed into error contexts, so the redaction is the only thing between
+        // a password and a pipeline log.
+        assert_eq!(
+            redact_catalog("ducklake:postgres:dbname=d user=u password=hunter2"),
+            "ducklake:postgres:dbname=d user=u password=***"
+        );
+        // Inside the quoted connection string, where the closing quote ends it.
+        assert_eq!(
+            redact_catalog("ATTACH 'ducklake:postgres:dbname=d password=s3cr3t' AS dl"),
+            "ATTACH 'ducklake:postgres:dbname=d password=***' AS dl"
+        );
+        // Case-insensitive, and repeated.
+        assert_eq!(
+            redact_catalog("Password=a;password=b"),
+            "Password=***;password=***"
+        );
+        // Nothing to redact: left alone, not rewritten.
+        assert_eq!(
+            redact_catalog("ducklake:/tmp/t.ducklake"),
+            "ducklake:/tmp/t.ducklake"
+        );
     }
 }

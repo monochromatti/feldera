@@ -35,7 +35,7 @@ use feldera_types::program_schema::Relation;
 use feldera_types::transport::ducklake::DuckLakeWriterConfig;
 use tokio_util::sync::CancellationToken;
 
-use super::catalog::Catalog;
+use super::catalog::{Catalog, redact_catalog};
 use super::protocol::{self, Batch, Delta, Op};
 use crate::controller::{ControllerInner, EndpointId};
 use crate::transport::Step;
@@ -64,7 +64,9 @@ pub struct DuckLakeWriter {
 
     /// The controller, for reporting progress and failures.  Weak because the
     /// controller owns the endpoint.
-    #[allow(dead_code)]
+    ///
+    /// `fail_and_hold` reports through it, because an integrated endpoint is
+    /// never handed `connect` and so never receives `callbacks`.
     controller: Weak<ControllerInner>,
 
     /// Rows written in the batch in flight, for the endpoint's status line.
@@ -138,7 +140,6 @@ impl DuckLakeWriter {
         // before publishing; this endpoint cannot, so one group must carry exactly
         // one publishing endpoint.  That is a deployment rule the connector cannot
         // check from inside a single endpoint's configuration.
-        let _ = &config.tables;
         // A buffered step is a different step: the controller would hand this
         // writer a batch covering several steps, and the guard row can name only
         // one.  Refusing at construction is better than publishing output the
@@ -150,7 +151,7 @@ impl DuckLakeWriter {
                     .to_string(),
             });
         }
-        Ok(Self {
+        let mut writer = Self {
             endpoint_id,
             endpoint_name: endpoint_name.to_string(),
             config: config.clone(),
@@ -164,7 +165,17 @@ impl DuckLakeWriter {
             callbacks: None,
             pending: Pending::default(),
             poisoned: None,
-        })
+        };
+        // Resolved here rather than on the first step.  A `tables` mapping that
+        // names no view, or more than one, is a configuration error, and finding it
+        // in `encode` meant the output thread held until shutdown while the pipeline
+        // looked merely idle.  The catalog itself is still attached on first use: an
+        // integrated endpoint never gets `connect`, and attaching at construction
+        // would hold a DuckDB attachment, and its file lock, from pipeline start.
+        writer.target = Some(writer.resolve_target().map_err(|e| {
+            ControllerError::invalid_transport_configuration(endpoint_name, &e.to_string())
+        })?);
+        Ok(writer)
     }
 
     /// Resolve the single table this endpoint writes.
@@ -219,12 +230,11 @@ impl DuckLakeWriter {
         if self.catalog.is_some() {
             return Ok(());
         }
-        self.target = Some(self.resolve_target()?);
         let catalog = Catalog::open(&self.config)?;
         tracing::info!(
             "ducklake: {} attached {:?} at frontier {} epoch {}",
             self.endpoint_name,
-            self.config.catalog.catalog,
+            redact_catalog(&self.config.catalog.catalog),
             catalog.frontier().unwrap_or_default(),
             catalog.epoch()
         );
@@ -354,10 +364,22 @@ impl DuckLakeWriter {
             "ducklake: {} failed to publish: {detail}",
             self.endpoint_name
         );
+        let report = anyhow!("the DuckLake connector could not publish a step: {detail}");
         if let Some(callbacks) = &self.callbacks {
-            callbacks.error(
+            callbacks.error(true, report, Some("ducklake_publication"));
+        } else if let Some(controller) = self.controller.upgrade() {
+            // An integrated endpoint is never handed `connect` (the controller takes
+            // `into_encoder` and never calls it), so `callbacks` is `None` for every
+            // writer the engine creates.  Without this branch a failed publication is
+            // a log line and a thread that holds forever: no `output_transport_error`,
+            // no error count, no health change — and the error returned when shutdown
+            // ends the hold is downgraded to a debug log by the controller.  Reporting
+            // here is what turns it into something an operator can see.
+            controller.output_transport_error(
+                self.endpoint_id,
+                &self.endpoint_name,
                 true,
-                anyhow!("the DuckLake connector could not publish a step: {detail}"),
+                report,
                 Some("ducklake_publication"),
             );
         }
@@ -435,8 +457,12 @@ const MAX_MULTIPLICITY: i64 = 1024;
 
 impl OutputConsumer for DuckLakeWriter {
     fn max_buffer_size_bytes(&self) -> usize {
-        // Rows are read from the engine's own batch representation, so there is
-        // no transport buffer to bound.
+        // Rows are read from the engine's own batch representation, so there is no
+        // *transport* buffer to bound.  The claim stops there: `Pending::deltas`
+        // holds every row of the step in memory until `batch_end`, because a step
+        // is published in one transaction and there is no cursor-friendly way to
+        // build it incrementally.  Bounding that here would only make the engine
+        // split a step it cannot split.
         usize::MAX
     }
 
@@ -549,7 +575,12 @@ impl OutputEndpoint for DuckLakeWriter {
     }
 
     fn push_buffer(&mut self, _buffer: &[u8]) -> AnyResult<()> {
-        unreachable!("the DuckLake connector is its own encoder")
+        // The trait asks for an error here, not a panic: "If a given transport does
+        // not implement this API, it should return an error".  Nothing calls this
+        // today — the integrated path drives the `OutputConsumer` methods — but
+        // `IntegratedOutputEndpoint::as_endpoint()` exposes this trait, and a panic
+        // on that path would take down the output thread.
+        bail!("the DuckLake connector is its own encoder and takes no byte buffers")
     }
 
     fn push_key(
@@ -558,7 +589,7 @@ impl OutputEndpoint for DuckLakeWriter {
         _val: Option<&[u8]>,
         _headers: &[(&str, Option<&[u8]>)],
     ) -> AnyResult<()> {
-        unreachable!("the DuckLake connector is its own encoder")
+        bail!("the DuckLake connector is its own encoder and takes no keyed byte records")
     }
 
     fn is_fault_tolerant(&self) -> bool {
@@ -670,7 +701,31 @@ mod tests {
 
     #[test]
     fn an_ambiguous_endpoint_is_refused_instead_of_guessing() {
-        let w = writer(&config(&[("v1", "a"), ("v2", "b")]), "unrelated");
-        assert!(w.resolve_target().is_err());
+        // Refused at construction, not on the first step: this used to be found in
+        // `ensure_connected`, i.e. inside the output thread, which then held until
+        // shutdown while the pipeline looked merely idle.  The requirement is
+        // unchanged — refuse rather than guess — so the assertion moved rather than
+        // the expectation.
+        let refused = DuckLakeWriter::new(
+            0,
+            "unrelated",
+            &config(&[("v1", "a"), ("v2", "b")]),
+            &None,
+            &Relation::empty(),
+            Weak::new(),
+            CancellationToken::new(),
+            false,
+            false,
+            false,
+        );
+        assert!(
+            refused.is_err(),
+            "an endpoint that names no configured view must be refused, not guessed at"
+        );
+        let error = refused.err().expect("checked above");
+        assert!(
+            format!("{error}").contains("cannot tell which"),
+            "the error names the ambiguity: {error}"
+        );
     }
 }

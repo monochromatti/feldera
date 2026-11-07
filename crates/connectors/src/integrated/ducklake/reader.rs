@@ -106,7 +106,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::{
-    catalog::{attach_statement, quote_ident, sql_literal},
+    catalog::{attach_statement, quote_ident, redact_catalog, sql_literal},
     ffi::{Conn, Db, Library, Rows},
 };
 
@@ -208,6 +208,9 @@ impl InputReader for DuckLakeInputReader {
     }
 
     fn is_closed(&self) -> bool {
+        // True once the worker's receiver is dropped, which `open`'s closure does
+        // after reporting any error — so a closed reader with no error reported means
+        // the worker returned without one.
         self.sender.is_closed()
     }
 }
@@ -238,12 +241,28 @@ pub fn open(
         schema: config.catalog.schema.clone(),
         table: config.table.clone(),
     };
+    // Validated here, not on the first read: these two names are interpolated into
+    // SQL from the pipeline configuration, and a worker thread that fails its first
+    // query is much harder to attribute than a pipeline that refuses to start.
+    quote_ident(&table.schema).with_context(|| {
+        format!(
+            "the DuckLake input {endpoint_name:?} names schema {:?}, which is not a plain \
+             identifier",
+            table.schema
+        )
+    })?;
+    quote_ident(&table.table).with_context(|| {
+        format!(
+            "the DuckLake input {endpoint_name:?} names table {:?}, which is not a plain identifier",
+            table.table
+        )
+    })?;
     let state = ReaderState::from_metadata(resume.as_ref())?;
     // The interval is the pipeline's decision, so it is read here rather than
     // fixed: a test and a low-latency pipeline want very different values.
     let poll_interval: Duration = config.poll_interval().into();
 
-    let (sender, receiver) = unbounded_channel();
+    let (sender, mut receiver) = unbounded_channel();
     let finished = Arc::new(AtomicBool::new(false));
     let worker_finished = Arc::clone(&finished);
     thread::Builder::new()
@@ -253,16 +272,21 @@ pub fn open(
                 table,
                 stream,
                 consumer.as_ref(),
-                receiver,
+                &mut receiver,
                 state,
                 poll_interval,
             );
-            // Report before publishing the closure: `is_closed` is what makes the
-            // controller substitute a generic "closed before completing replay", and
-            // it must not win the race against the real catalog error.
+            // `is_closed` answers "has this receiver been dropped", and the controller
+            // reads a closed reader as "it went away without reporting" — substituting
+            // a generic "closed before completing replay" for the real error.  `run`
+            // used to own the receiver, so it was dropped as `run` returned, i.e.
+            // before the error below was reported: the comment claimed the report won
+            // that race and the field order made sure it lost.  Holding the receiver
+            // here and dropping it after `consumer.error` is what makes the claim true.
             if let Err(error) = result {
                 consumer.error(true, error, None);
             }
+            drop(receiver);
             worker_finished.store(true, Ordering::Release);
         })
         .context("spawning the DuckLake reader")?;
@@ -281,7 +305,7 @@ pub(super) struct Table {
     catalog: DuckLakeCatalogConfig,
     schema: String,
     table: String,
-    /// The catalog alias, quoted for use in a path.
+    /// The catalog alias, **already quoted** as `ATTACH ... AS` created it.
     alias: String,
 }
 
@@ -305,17 +329,23 @@ impl Table {
         })
     }
 
-    fn qualified_name(&self) -> String {
-        // The alias is quoted like the rest: `ATTACH ... AS <alias>` created it with
-        // `quote_ident`, so an alias needing quotes (a dot, a dash, mixed case) has
-        // to be referred to the same way.  Unquoted, `my.alias.db.tbl` silently
-        // addresses a different catalog.
-        format!(
+    /// The fully qualified name of the table, or an error.
+    ///
+    /// `alias` is stored quoted — `ATTACH ... AS` created it with `quote_ident` — so
+    /// it is used as it stands.  Quoting it again fails, and the `unwrap_or_else`
+    /// that used to absorb that failure is how `schema` and `table`, which come
+    /// straight from the pipeline configuration, reached the SQL unquoted and
+    /// unvalidated: a table named `x FROM y --` was interpolated verbatim into
+    /// `snapshot_rows`' statement.  The doc comment above it claimed the opposite,
+    /// which is how the mistake survived review.  Both are now checked, and a name
+    /// that is not a plain identifier is an error the operator sees.
+    fn qualified_name(&self) -> AnyResult<String> {
+        Ok(format!(
             "{}.{}.{}",
-            quote_ident(&self.alias).unwrap_or_else(|_| self.alias.clone()),
-            quote_ident(&self.schema).unwrap_or_else(|_| self.schema.clone()),
-            quote_ident(&self.table).unwrap_or_else(|_| self.table.clone())
-        )
+            self.alias,
+            quote_ident(&self.schema)?,
+            quote_ident(&self.table)?
+        ))
     }
 
     /// The whole table as JSON rows.
@@ -323,7 +353,7 @@ impl Table {
         let sql = format!(
             "SELECT to_json({})::VARCHAR FROM {}",
             self.projection,
-            self.qualified_name()
+            self.qualified_name()?
         );
         conn.query(&sql, &[])
             .with_context(|| format!("reading the snapshot of {}.{}", self.schema, self.table))
@@ -392,9 +422,15 @@ pub(super) fn projection(relation: &Relation) -> AnyResult<String> {
 
 /// A read-only attachment to the catalog.
 pub(super) struct ReaderCatalog<'a> {
-    #[allow(dead_code)] // held so that `conn` outlives its database
-    db: Db<'a>,
+    /// The connection.  Declared **before** `db` on purpose, as in [`super::catalog`]:
+    /// fields drop in declaration order, and `duckdb_close` requires every
+    /// connection to be gone first.  Declared the other way round — which is how
+    /// this started, with a comment asserting the opposite — `Db::drop` closed the
+    /// database while `Conn` was still open and `Conn::drop` then disconnected from a
+    /// closed handle, on every re-attach, i.e. on every checkpoint restore.
     conn: Conn<'a>,
+    #[allow(dead_code)] // owns the database handle; closed after `conn`
+    db: Db<'a>,
     catalog: DuckLakeCatalogConfig,
 }
 
@@ -405,8 +441,12 @@ impl<'a> ReaderCatalog<'a> {
         if let Some(dir) = &catalog.extension_directory {
             library.set_extension_directory(*config, dir)?;
         }
-        let db = Db::open(library, ":memory:", *config)
-            .with_context(|| format!("opening DuckDB for catalog {:?}", catalog.catalog))?;
+        let db = Db::open(library, ":memory:", *config).with_context(|| {
+            format!(
+                "opening DuckDB for catalog {:?}",
+                redact_catalog(&catalog.catalog)
+            )
+        })?;
         let conn = db.connect()?;
 
         // `LOAD` first and `INSTALL` only if it is missing — the same order, for
@@ -417,10 +457,15 @@ impl<'a> ReaderCatalog<'a> {
             conn.execute("LOAD ducklake", &[])?;
         }
         conn.execute(&attach_statement(catalog, true)?, &[])
-            .with_context(|| format!("attaching catalog {:?} read-only", catalog.catalog))?;
+            .with_context(|| {
+                format!(
+                    "attaching catalog {:?} read-only",
+                    redact_catalog(&catalog.catalog)
+                )
+            })?;
         Ok(Self {
-            db,
             conn,
+            db,
             catalog: catalog.clone(),
         })
     }
@@ -452,7 +497,12 @@ impl<'a> ReaderCatalog<'a> {
         }
         self.conn
             .execute(&attach_statement(&self.catalog, true)?, &[])
-            .with_context(|| format!("re-attaching catalog {:?}", self.catalog.catalog))
+            .with_context(|| {
+                format!(
+                    "re-attaching catalog {:?}",
+                    redact_catalog(&self.catalog.catalog)
+                )
+            })
     }
 
     /// `ducklake_current_snapshot` — the last *committed* snapshot, which is also
@@ -565,7 +615,7 @@ fn run(
     table: Table,
     mut stream: Box<dyn DeCollectionStream>,
     consumer: &dyn InputConsumer,
-    mut receiver: UnboundedReceiver<InputReaderCommand>,
+    receiver: &mut UnboundedReceiver<InputReaderCommand>,
     mut state: ReaderState,
     poll_interval: Duration,
 ) -> AnyResult<()> {

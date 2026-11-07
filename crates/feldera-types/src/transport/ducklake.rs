@@ -203,6 +203,12 @@ pub struct DuckLakeWriterConfig {
     /// Default: `true`. Disabling it turns a catalog that is out of step into a
     /// startup error instead of a rewrite, which is what a deployment that
     /// suspects the two disagree wants.
+    ///
+    /// **Spell this key exactly.** The catalog block is `#[serde(flatten)]`ed, and
+    /// `deny_unknown_fields` cannot be combined with `flatten`, so a misspelled key
+    /// is silently ignored and this default applies — a `send_snapshott: false`
+    /// deployment would get the rewrite it asked not to have. The connector cannot
+    /// detect the typo, so the spelling is the contract.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub send_snapshot: bool,
 }
