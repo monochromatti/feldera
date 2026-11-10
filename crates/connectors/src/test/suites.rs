@@ -21,8 +21,12 @@ pub use crate::integrated::delta_table::merge::model as delta_merge;
 pub use crate::integrated::delta_table::output::parallel as delta_output;
 #[cfg(feature = "with-deltalake")]
 pub use crate::integrated::delta_table::test as delta_table;
-#[cfg(feature = "with-dynamodb")]
+// Gated on nothing: the suite needs no service and no optional dependency, so
+// gating it on one would only hide it from builds that lack that one.  It was
+// previously behind `with-dynamodb`, a copy-paste accident that dropped five
+// engine tests from every build that did not enable DynamoDB.
 pub use crate::integrated::ducklake::test as ducklake;
+#[cfg(feature = "with-dynamodb")]
 pub use crate::integrated::dynamodb::test as dynamodb;
 #[cfg(feature = "with-postgres-cdc")]
 pub use crate::integrated::postgres::cdc_input::tests as postgres_cdc_destination;
