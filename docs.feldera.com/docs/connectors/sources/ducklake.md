@@ -42,6 +42,12 @@ The connector polls: DuckLake exposes changes as a query over a snapshot range, 
 subscription. `poll_interval` is the floor on end-to-end latency, not a rate limit — a poll
 that finds nothing costs one query against the catalog.
 
+A catalog that goes **backwards** is refused. DuckLake numbers its snapshots; a catalog whose
+current snapshot is lower than the one in the checkpoint is a restored backup or a replaced
+catalog, and following it would re-read history the pipeline has already applied while looking
+perfectly healthy. The connector reports the error and stops instead. To re-read a rebuilt
+catalog from the beginning, run the pipeline from an empty checkpoint.
+
 ## Fault tolerance
 
 The connector supports [fault tolerance](/pipelines/fault-tolerance) with **at-least-once**
@@ -88,6 +94,11 @@ again.
 - **Changes are visible only after they commit.** An uncommitted transaction in another
   connection is not read, which is what makes the read repeatable, but it also means the
   connector has no way to see a writer's in-flight work.
+- **The bootstrap is one query, buffered in the pipeline.** There is no cursor into a DuckLake
+  snapshot, so the first read returns the table's whole contents at once and the pipeline holds
+  them while they are ingested. Bootstrap memory is therefore proportional to the table, and a
+  table large enough to matter is better read once by a pipeline that then follows it, than
+  re-bootstrapped per restart.
 - **The DuckDB library and the DuckLake extension are pinned together.** Extension binaries
   are platform-specific and version-locked: the connector requires the DuckDB 2.0 C library
   and a DuckLake extension built against it.

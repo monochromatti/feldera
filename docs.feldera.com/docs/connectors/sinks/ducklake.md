@@ -54,10 +54,21 @@ output group in the catalog, and updates it in the same transaction as the rows 
 | `digest`       | `VARCHAR` | Fingerprint of the rows that step published                         |
 | `updated_at`   | `TIMESTAMP` | When the row was last written                                     |
 
+The connector creates this table if it does not exist, so a deployment does not have to know its
+schema. If a table of that name is already there it must have these columns, because the first
+guard read fails otherwise — the connector will not guess at a differently shaped one.
+
 A step publishes in one transaction: delete and insert the step's rows, then advance the
 guard row. A step the guard row already covers is a no-op — and if the guard row names that
 step but records a different digest, the connector stops instead of guessing, because the
 catalog then holds output that the engine did not produce.
+
+a step, and the engine's step numbers survive a restart: a pipeline restored from a checkpoint
+continues numbering from where the checkpoint left off. That is what lets a restarted writer
+recognise the steps the catalog already holds. The connector suite restarts a pipeline
+mid-history and asserts that the rows published next continue past the frontier in the guard
+row, which fails if the numbering restarts, because a step numbered below the frontier reads as
+`Stale` and the writer holds instead of publishing.
 
 The connector does not declare a fault-tolerance model of its own — that is the pipeline's
 setting. What it does do is keep exactly-once pipelines exactly-once: a pipeline with
@@ -75,7 +86,7 @@ catalog is the only place the connector records progress.
 | `generation`*            | string  |                    | Identity of this publication arrangement, for example a pipeline generation. Part of every batch identity. |
 | `guard_table`            | string  | `connector_guard`  | Table holding the group's guard row, in the catalog schema below. |
 | `schema`                 | string  | `main`             | DuckLake schema that holds the output tables and the guard table. |
-| `tables.<view>.key_columns` | array | `[]`             | Columns that identify a row. With key columns the connector replaces by key; without them it deletes one matching row and inserts one, keeping the table a bag. |
+| `tables.<view>.key_columns` | array | `[]`             | Columns that identify a row. With key columns the connector replaces by key; without them it deletes one matching row and inserts one, keeping the table a bag. Key columns are a promise that the view emits each key at most once per step: a keyed replacement removes one row per key, so two rows on one key leave one behind. |
 | `alias`                  | string  | `dl`               | Name under which the catalog is attached on the connector's connection. It must differ from the name of any other catalog the pipeline attaches. |
 | `epoch`                  | integer |                    | Ownership epoch. Must strictly increase to take over a group from a previous owner; see [taking over a group](#taking-over-a-group). |
 | `send_snapshot`          | bool    | `true`             | Accept a full snapshot from the engine, which rewrites the table. With `false`, a snapshot is refused and the connector reports an error instead of rewriting, for a deployment that would rather stop than have its tables replaced. |
@@ -100,7 +111,8 @@ The connector writes into a table it does not create. What it expects of that ta
   NOT DISTINCT FROM`, limited to one row — so a table with no key columns must tolerate
   duplicate rows being distinct objects, which is exactly bag semantics. Declaring
   `key_columns` makes the delete a key match instead, which is what a table with a primary
-  key wants.
+  key wants — provided the view really does emit each key once per step, since one keyed
+  replacement removes one row.
 - **The connector's own columns do not collide.** `connector_guard` in the catalog schema is
   the connector's; a table of that name is not usable as an output table.
 
