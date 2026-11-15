@@ -35,7 +35,7 @@ use feldera_types::transport::ducklake::{
 use serde_json::json;
 
 use super::catalog::Catalog;
-use super::protocol::{Batch, Decision, Delta, Op};
+use super::protocol::{Batch, Decision, Delta, Guard, Op};
 use super::reader::{ReaderCatalog, ReaderState, Table, advance};
 
 /// A writer config pointing at a fresh catalog, or `None` when the integration
@@ -1611,4 +1611,150 @@ fn a_resync_clears_only_its_own_group() {
         3,
         "group B's guard reached its resync"
     );
+}
+
+/// Two writers that attach one catalog at the same instant must both come up.
+///
+/// This is the part of §8.1 that no single-process case reaches. `Catalog::open`
+/// runs `CREATE TABLE IF NOT EXISTS`, then reads the guard, then
+/// `INSERT … WHERE NOT EXISTS` — two check-then-act sequences whose conflict
+/// surfaces only at `COMMIT`, which a file-backed catalog cannot produce because
+/// its metadata manager serialises writers. So the failure is invisible to every
+/// other case in this file.
+///
+/// The window is narrow, but it is the instant two pipelines for one output group
+/// start together after a deployment, which is exactly when a catalog is most
+/// likely to be fresh. The first phase races the *table's* creation with two
+/// different groups, the second races the *row's* creation with one group twice.
+///
+/// A writer that loses this race must not fail: it is a writer that arrived
+/// second, and the guard row it finds is the answer it would have provisioned.
+#[test]
+fn two_writers_attach_one_fresh_catalog_at_once() {
+    let Some((dsn, dir)) = postgres_or_skip("two_writers_attach_one_fresh_catalog_at_once") else {
+        return;
+    };
+    let data = dir.path().join("data").display().to_string();
+    let suffix = std::process::id();
+    let config = |group: String| postgres_group_config(&dsn, &data, &group, &[]);
+
+    // Bootstrap the catalog once, then drop the guard table, so what races below is
+    // the connector's provisioning and not DuckLake's own metadata bootstrap.
+    {
+        let mut catalog =
+            Catalog::open(&config(format!("boot{suffix}"))).expect("bootstrap the catalog");
+        catalog
+            .execute_sql(&format!(
+                "DROP TABLE IF EXISTS {DEFAULT_SCHEMA}.{DEFAULT_GUARD_TABLE}"
+            ))
+            .expect("drop the guard table");
+    }
+
+    let (group_a, group_b, group_c) = (
+        format!("pa{suffix}"),
+        format!("pb{suffix}"),
+        format!("pc{suffix}"),
+    );
+
+    // Phase 1: one guard table, two groups, both attaching at once.
+    let (first, second) = attach_at_once(&config(group_a.clone()), &config(group_b.clone()));
+    let first = first.expect("the first group provisioned the table and its row");
+    let second = second.expect("the second group joined the table the first created");
+    for (catalog, group) in [(&first, &group_a), (&second, &group_b)] {
+        let guard = catalog
+            .read_guard()
+            .unwrap_or_else(|e| panic!("{group}: exactly one guard row after the race: {e:#}"));
+        // The row both writers would have provisioned on their own: comparing
+        // against `Guard::initial` keeps the sentinels (a fresh frontier is not 0)
+        // in one place.
+        assert_eq!(guard, Guard::initial(group.clone(), "gen-1"));
+    }
+
+    // Phase 2: one group, two writers, both attaching at once. Neither may fail:
+    // the second is a writer that arrived second, and the row it finds is the one
+    // it would have provisioned itself.
+    let table_c = format!("tc{suffix}");
+    let (first, second) = attach_at_once(
+        &postgres_group_config(&dsn, &data, &group_c, &[&table_c]),
+        &postgres_group_config(&dsn, &data, &group_c, &[&table_c]),
+    );
+    let mut writers = Vec::new();
+    for (i, result) in [first, second].into_iter().enumerate() {
+        let catalog =
+            result.unwrap_or_else(|e| panic!("writer {i} of one group must join, not fail: {e:#}"));
+        assert_eq!(
+            catalog.read_guard().expect("a readable guard"),
+            Guard::initial(group_c.clone(), "gen-1")
+        );
+        writers.push(catalog);
+    }
+
+    // Whatever the race left behind, the group must behave as one: the step below
+    // applies once and the second writer recognises it.  Two guard rows diverge
+    // only if a write matches one of them, which is why this is the assertion that
+    // matters and the row count is not.
+    writers[0]
+        .execute_sql(&format!(
+            "CREATE TABLE dl.{table_c} (id BIGINT, name VARCHAR)"
+        ))
+        .expect("create the group's table");
+    // `appended(catalog, group, table, base, rows)` publishes the step `base →
+    // base + 1`, and a freshly provisioned guard sits at `NOWHERE`, so the step to
+    // publish is the one based there.
+    let batch = appended(&writers[0], &group_c, &table_c, 0, 3);
+    let mut decisions = Vec::new();
+    for writer in &mut writers {
+        decisions.push(
+            writer
+                .publish(&batch, None, super::writer::MAX_ATTEMPTS)
+                .unwrap_or_else(|e| panic!("{group_c}: publishing step 1: {e:#}"))
+                .decision,
+        );
+    }
+    let applied = decisions
+        .iter()
+        .filter(|decision| **decision == Decision::Apply)
+        .count();
+    let duplicated = decisions
+        .iter()
+        .filter(|decision| **decision == Decision::Duplicate)
+        .count();
+    assert_eq!(
+        (applied, duplicated),
+        (1, 1),
+        "{group_c}: the same step published by two writers applies once, got {decisions:?}"
+    );
+    for writer in &writers {
+        assert_eq!(
+            writer.frontier().expect("a readable guard"),
+            batch.end,
+            "{group_c}: the frontier is the step's end, whether the writer published it or \
+             recognised it"
+        );
+    }
+}
+
+/// Attaches two catalogs at the same instant, through the channel rendezvous the
+/// concurrency case uses for the same reason: a panic in one thread has to fail
+/// the case rather than leave its peer waiting forever.
+fn attach_at_once(
+    first: &DuckLakeWriterConfig,
+    second: &DuckLakeWriterConfig,
+) -> (anyhow::Result<Catalog>, anyhow::Result<Catalog>) {
+    let (tx_first, rx_first) = std::sync::mpsc::sync_channel::<()>(1);
+    let (tx_second, rx_second) = std::sync::mpsc::sync_channel::<()>(1);
+    let first_cfg = first.clone();
+    let second_cfg = second.clone();
+    let handle_first = std::thread::spawn(move || {
+        rendezvous(&tx_first, &rx_second, "first");
+        Catalog::open(&first_cfg)
+    });
+    let handle_second = std::thread::spawn(move || {
+        rendezvous(&tx_second, &rx_first, "second");
+        Catalog::open(&second_cfg)
+    });
+    (
+        handle_first.join().expect("the first thread"),
+        handle_second.join().expect("the second thread"),
+    )
 }

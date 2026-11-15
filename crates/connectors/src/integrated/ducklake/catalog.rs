@@ -130,6 +130,12 @@ pub struct Catalog {
     output_group: String,
     generation: String,
     epoch: u64,
+    /// Identity of this writer's attempt to provision the guard row.
+    ///
+    /// DuckLake has no unique constraints, so a concurrent provision can leave two
+    /// rows; the token is what lets one of them be removed deterministically.  See
+    /// [`Catalog::provision_or_repair_guard`].
+    token: String,
     /// DuckLake table -> key columns, for keyed replacement.
     keys: BTreeMap<String, Vec<String>>,
     /// Tables this connector owns; a batch writing anything else is rejected.
@@ -192,6 +198,7 @@ impl Catalog {
             output_group: config.output_group.clone(),
             generation: config.generation.clone(),
             epoch: config.epoch.unwrap_or(1),
+            token: provisioning_token(),
             keys,
             tables,
             conn,
@@ -236,10 +243,21 @@ impl Catalog {
                frontier BIGINT NOT NULL, \
                batch_id VARCHAR, \
                digest VARCHAR, \
-               updated_at TIMESTAMP)",
+               updated_at TIMESTAMP, \
+               token VARCHAR)",
             self.guard_table_sql()?
         );
         self.conn.execute(&sql, &[])?;
+        // `IF NOT EXISTS` above does nothing when a table of this name is already
+        // there, including one this connector created before the token existed.
+        // Adding the column is idempotent, so it runs on every open.
+        self.conn.execute(
+            &format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS token VARCHAR",
+                self.guard_table_sql()?
+            ),
+            &[],
+        )?;
         Ok(())
     }
 
@@ -247,7 +265,12 @@ impl Catalog {
     fn settle_ownership(&mut self, requested_epoch: Option<u64>) -> Result<()> {
         let guard = match self.read_guard() {
             Ok(guard) => guard,
-            Err(e) if format!("{e}").contains("exactly one guard row") => self.provision_guard()?,
+            // Only a group with *no* row is provisioned here; a duplicated row is
+            // accepted by `read_guard`, which is what makes this a repair the
+            // caller does not depend on.
+            Err(e) if format!("{e}").contains("has no guard row") => {
+                self.provision_or_repair_guard()?
+            }
             Err(e) => return Err(e),
         };
         if guard.generation != self.generation {
@@ -286,60 +309,156 @@ impl Catalog {
             .conn
             .query(&sql, &[Value::Text(self.output_group.clone())])?;
         let rows = rows.into_rows();
-        if rows.len() != 1 {
-            bail!(
-                "output group {:?} must have exactly one guard row, found {}",
-                self.output_group,
-                rows.len()
-            );
+        if rows.is_empty() {
+            bail!("output group {:?} has no guard row", self.output_group);
         }
-        let row = &rows[0];
-        let cell = |i: usize| row.get(i).cloned().flatten();
         // Parsed rather than defaulted: a NULL or non-numeric cell used to become
         // 0, which then made the conditional guard `UPDATE` match no row and
         // surface as "the guard did not advance" — the right refusal, with a
         // cause that sent the operator looking in the wrong place.
-        let number = |i: usize, column: &str| -> Result<u64> {
-            let text = cell(i)
-                .with_context(|| format!("guard row of {:?} has no {column}", self.output_group))?;
-            text.parse().with_context(|| {
-                format!(
-                    "guard row of {:?} has a non-numeric {column}: {text:?}",
-                    self.output_group
-                )
+        let parse = |row: &Vec<Option<String>>| -> Result<Guard> {
+            let cell = |i: usize| row.get(i).cloned().flatten();
+            let number = |i: usize, column: &str| -> Result<u64> {
+                let text = cell(i).with_context(|| {
+                    format!("guard row of {:?} has no {column}", self.output_group)
+                })?;
+                text.parse().with_context(|| {
+                    format!(
+                        "guard row of {:?} has a non-numeric {column}: {text:?}",
+                        self.output_group
+                    )
+                })
+            };
+            Ok(Guard {
+                output_group: cell(0).unwrap_or_default(),
+                generation: cell(1).unwrap_or_default(),
+                epoch: number(2, "epoch")?,
+                frontier: number(3, "frontier")?,
+                batch_id: cell(4),
+                digest: cell(5),
             })
         };
-        Ok(Guard {
-            output_group: cell(0).unwrap_or_default(),
-            generation: cell(1).unwrap_or_default(),
-            epoch: number(2, "epoch")?,
-            frontier: number(3, "frontier")?,
-            batch_id: cell(4),
-            digest: cell(5),
-        })
+        let mut guards = rows.iter().map(&parse).collect::<Result<Vec<Guard>>>()?;
+        // More than one row is *not* a corruption, and refusing it would wedge the
+        // catalog: DuckLake rejects `PRIMARY KEY` and `UNIQUE` ("PRIMARY KEY/UNIQUE
+        // constraints are not supported in DuckLake"), so nothing in the storage
+        // stops two writers provisioning the same group at once — their
+        // `INSERT … WHERE NOT EXISTS` statements are check-then-act and two inserts
+        // do not conflict.  Identical rows are harmless because every write is a
+        // single statement that matches all of them: the conditional `UPDATE`
+        // advances them together or not at all, so a duplicated guard stays a
+        // duplicated guard with one value rather than diverging.  Rows that
+        // *disagree* are a different matter — that would be two histories — and are
+        // refused.
+        let first = guards.remove(0);
+        for other in &guards {
+            if *other != first {
+                bail!(
+                    "output group {:?} has {} guard rows that disagree (frontiers {} and {}); \
+                     refusing to pick one",
+                    self.output_group,
+                    guards.len() + 1,
+                    first.frontier,
+                    other.frontier
+                );
+            }
+        }
+        Ok(first)
     }
 
-    fn provision_guard(&mut self) -> Result<Guard> {
+    /// The `token` of every guard row of this group, oldest column absent when the
+    /// row predates it (see `create_guard_table`).
+    fn guard_tokens(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT coalesce(token, '') FROM {} WHERE output_group = ?",
+                    self.guard_table_sql()?
+                ),
+                &[Value::Text(self.output_group.clone())],
+            )?
+            .into_rows();
+        Ok(rows
+            .iter()
+            .map(|row| row.first().cloned().flatten().unwrap_or_default())
+            .collect())
+    }
+
+    /// The single integer a `SELECT count(*)`-shaped query returns.
+    fn count_rows(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        let rows = self.conn.query(sql, params)?.into_rows();
+        let text = rows
+            .first()
+            .and_then(|row| row.first().cloned().flatten())
+            .with_context(|| format!("counting rows with {sql:?}"))?;
+        text.parse()
+            .with_context(|| format!("counting rows with {sql:?}: {text:?}"))
+    }
+
+    fn provision_or_repair_guard(&mut self) -> Result<Guard> {
         let guard = Guard::initial(self.output_group.clone(), self.generation.clone());
         let sql = format!(
             "INSERT INTO {} (output_group, generation, epoch, frontier, batch_id, digest, \
-             updated_at) SELECT ?, ?, ?, ?, ?, ?, now() WHERE NOT EXISTS (SELECT 1 FROM {} \
-             WHERE output_group = ?)",
+             updated_at, token) SELECT ?, ?, ?, ?, ?, ?, now(), ? WHERE NOT EXISTS \
+             (SELECT 1 FROM {} WHERE output_group = ?)",
             self.guard_table_sql()?,
             self.guard_table_sql()?
         );
+        let group = Value::Text(self.output_group.clone());
         self.conn.execute(
             &sql,
             &[
-                Value::Text(guard.output_group.clone()),
+                group.clone(),
                 Value::Text(guard.generation.clone()),
                 Value::Int(guard.epoch as i64),
                 Value::Int(guard.frontier as i64),
                 Value::Null,
                 Value::Null,
-                Value::Text(guard.output_group.clone()),
+                Value::Text(self.token.clone()),
+                group.clone(),
             ],
         )?;
+
+        // The `WHERE NOT EXISTS` above is a check-then-act and two writers can both
+        // pass it, because two *inserts* of different rows do not conflict in
+        // DuckLake — only two writes of the same row do.  So the row can end up
+        // duplicated, and this is the *opportunistic* repair: each provisioner
+        // removes the rows sorting above its own token, so the smallest token tends
+        // to survive whichever interleaving occurred.
+        //
+        // It is best-effort by construction, and that is deliberate: a delete and a
+        // concurrent insert do not conflict either, so the loser's row can land
+        // after the winner's delete and no amount of retrying closes that.  What
+        // makes it safe is `read_guard` accepting *identical* duplicates and every
+        // write being a single statement that matches all of them.  Rows
+        // provisioned before this column existed have no token; `coalesce` sorts
+        // them first, which keeps an older row rather than replacing it.
+        // Only a provisioner whose own row is present may repair: when the `INSERT`
+        // above was a no-op because a peer's row already existed, "delete
+        // everything above my token" would remove the only row and leave the group
+        // with none — the connector then reports "has no guard row", which is the
+        // failure this repair exists to prevent.  Observed as an intermittent
+        // failure of the concurrency case, not as a theory.
+        let mine = self.count_rows(
+            &format!(
+                "SELECT count(*) FROM {} WHERE output_group = ? AND token = ?",
+                self.guard_table_sql()?
+            ),
+            &[group.clone(), Value::Text(self.token.clone())],
+        )?;
+        if mine > 0 {
+            self.conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE output_group = ? AND coalesce(token, '') > ?",
+                    self.guard_table_sql()?
+                ),
+                &[group, Value::Text(self.token.clone())],
+            )?;
+        }
+        // Whatever survived is re-checked against this writer's generation and
+        // epoch by `settle_ownership`, so a writer that lost the race to a
+        // different generation is refused there rather than joined here.
         self.read_guard()
     }
 
@@ -476,15 +595,20 @@ impl Catalog {
         if decision != Decision::Apply {
             return Ok(Attempt { decision, guard });
         }
-        self.update_guard(&guard, batch)?;
+        // A fresh nonce per attempt, not a per-writer identity: the check this
+        // feeds has to tell "my `UPDATE` wrote this row" from "someone else wrote
+        // the values I meant to write", and a retry after a lost acknowledgement is
+        // the same writer.
+        let nonce = provisioning_token();
+        self.update_guard(&guard, batch, &nonce)?;
         self.apply_payload(batch, tables)?;
         Ok(Attempt { decision, guard })
     }
 
     /// Conditional guarded update; writes nothing if another writer won.
-    fn update_guard(&mut self, guard: &Guard, batch: &Batch) -> Result<()> {
+    fn update_guard(&mut self, guard: &Guard, batch: &Batch, nonce: &str) -> Result<()> {
         let sql = format!(
-            "UPDATE {} SET frontier = ?, batch_id = ?, digest = ?, updated_at = now() \
+            "UPDATE {} SET frontier = ?, batch_id = ?, digest = ?, token = ?, updated_at = now() \
              WHERE output_group = ? AND generation = ? AND epoch = ? AND frontier = ?",
             self.guard_table_sql()?
         );
@@ -494,12 +618,27 @@ impl Catalog {
                 Value::Int(batch.end as i64),
                 Value::Text(batch.batch_id()),
                 Value::Text(batch.digest()),
+                Value::Text(nonce.to_owned()),
                 Value::Text(guard.output_group.clone()),
                 Value::Text(guard.generation.clone()),
                 Value::Int(guard.epoch as i64),
                 Value::Int(guard.frontier as i64),
             ],
         )?;
+        // Writing the nonce is what makes the check below a check of *this*
+        // statement rather than of the row's final state.  Without it a
+        // conditional `UPDATE` that matched no row could still look like a
+        // success: a publisher that committed the same batch first leaves exactly
+        // the frontier and batch id this statement would have written, so the
+        // post-check passed and the deltas were applied twice.
+        let tokens = self.guard_tokens()?;
+        if tokens.is_empty() || tokens.iter().any(|token| token != nonce) {
+            bail!(
+                "guard for {:?} did not advance to {}; a concurrent publisher changed it",
+                guard.output_group,
+                batch.end
+            );
+        }
         let current = self.read_guard()?;
         if current.frontier != batch.end
             || current.batch_id.as_deref() != Some(batch.batch_id().as_str())
@@ -855,4 +994,24 @@ mod tests {
             "ducklake:/tmp/t.ducklake"
         );
     }
+}
+
+/// A value that sorts deterministically against the tokens of other processes.
+///
+/// The order itself is arbitrary — two provisioned guard rows carry the same
+/// frontier and epoch, so keeping either is the same decision — but it has to be
+/// *total* and computable without coordination, because the repair is what stops
+/// two racing writers from leaving a catalog that every later open refuses.
+fn provisioning_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{nanos:032x}-{:08x}-{:08x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }

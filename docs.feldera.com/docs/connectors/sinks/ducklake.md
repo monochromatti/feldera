@@ -115,6 +115,12 @@ The connector writes into a table it does not create. What it expects of that ta
   replacement removes one row.
 - **The connector's own columns do not collide.** `connector_guard` in the catalog schema is
   the connector's; a table of that name is not usable as an output table.
+- **The guard row is protected logically, not physically.** DuckLake has no `PRIMARY KEY` and
+  no `UNIQUE` (`Not implemented Error: PRIMARY KEY/UNIQUE constraints are not supported in
+  DuckLake`), so two connectors provisioning the same group at the same instant can leave two
+  guard rows. That is not a corruption and needs no repair: every write is one statement that
+  matches all rows of the group, so they advance together and hold one value. Rows that
+  *disagree* mean two histories, and the connector refuses to pick between them.
 
 ## Taking over a group
 
