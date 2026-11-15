@@ -3,9 +3,11 @@
 //! The unit tests and the catalog-level tests in `tests_live` cover the protocol
 //! itself — the decision, the guard row, the change window.  What they cannot
 //! cover is composition: that the writer publishes the step the controller hands
-//! it, that the reader's resume point survives the controller's stepping, and
-//! that a pipeline with a DuckLake source and a DuckLake sink moves rows from one
-//! catalog to the other.  That needs a real engine, which is what this suite is.
+//! it, that the reader's resume point survives the controller's stepping, that a
+//! pipeline with a DuckLake source and a DuckLake sink moves rows from one
+//! catalog to the other, and that a restarted pipeline continues the frontier
+//! numbering the guard row already holds rather than stalling on it.  That needs
+//! a real engine, which is what this suite is.
 //!
 //! The catalogs are file-backed temp directories, so no service is declared: a
 //! suite that needed PostgreSQL would have to skip itself wherever PostgreSQL is
@@ -859,5 +861,194 @@ pub fn two_engines_publishing_the_same_step_converge_on_one_outcome(
     assert_eq!(
         actual, expected,
         "the content both engines published is in the catalog exactly once"
+    );
+}
+
+/// A restarted pipeline publishes the step *after* the frontier its guard row
+/// already holds, rather than stalling on it or applying it again.
+///
+/// This pins the one thing the protocol assumes about the engine and cannot
+/// check itself.  `protocol::decide` compares a batch's step number against the
+/// `frontier` column, and that comparison only means anything if the step
+/// numbers of a restarted engine come from the same sequence as the ones before
+/// the restart.  If a restart renumbered from zero, every step of an inherited
+/// catalog would look older than the frontier, `decide` would answer `Stale` on
+/// each one, and the writer would hold — permanently, since a hold is cleared
+/// only by a resync and nothing would ask for one.  The catalog would stop
+/// growing while the pipeline reported healthy steps, which is the exact failure
+/// the guard row exists to prevent, one level down.
+///
+/// The append happens after the restart so that the re-read of the file cannot
+/// be mistaken for the step under test: the input resumes from the offset in the
+/// checkpoint, so rows written before it would be read twice.
+#[engine_test(requires(Storage, Checkpoints, FaultTolerance))]
+pub fn ducklake_output_continues_from_its_frontier_after_a_restart(
+    engine: &dyn PipelineTestEngine,
+) {
+    let dir = TempDir::new().expect("a temp directory");
+    let mut catalog = Catalog::open(&writer(&dir, "orders")).expect("attach the catalog");
+    create_table(&mut catalog, "orders");
+    drop(catalog);
+
+    let storage = dir.path().join("storage");
+    std::fs::create_dir_all(&storage).expect("a storage directory");
+
+    // `follow` keeps the input open past EOF so the second run can add rows; the
+    // file is newline-delimited rather than an array, which is what makes
+    // appending valid.
+    let input = tempfile::NamedTempFile::new().expect("a temp file");
+    let append = |ids: &[i64]| {
+        let mut file = input.as_file();
+        for id in ids {
+            writeln!(
+                file,
+                "{}",
+                json!({"insert": {"id": id, "b": true, "i": 10, "s": "a"}})
+            )
+            .expect("write a row");
+        }
+    };
+    append(&[1, 2]);
+
+    let config = serde_json::from_value(json!({
+        "name": "ducklake_restart",
+        "workers": 1,
+        "storage_config": { "path": storage },
+        "fault_tolerance": {},
+        "inputs": {
+            "rows": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": { "path": input.path(), "follow": true }
+                },
+                "format": {
+                    "name": "json",
+                    "config": { "update_format": "insert_delete", "array": false }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": { "name": "ducklake_output", "config": writer_config(&dir, "orders") }
+            }
+        }
+    }))
+    .expect("a pipeline config");
+
+    // A checkpoint needs an output with a persistent id: the guard row is only
+    // meaningful if the connector's own state is restored with it.
+    let circuit = || TestCircuit::Identity {
+        relation: relation(),
+        persistent_output_ids: vec![Some("output".to_string())],
+        input_properties: Vec::new(),
+        materialized: true,
+        persistent_ids: true,
+        table_version: 0,
+        attribute_defaults: std::collections::BTreeMap::new(),
+    };
+    let count = |dir: &TempDir| {
+        Catalog::open(&writer(dir, "orders"))
+            .ok()
+            .and_then(|mut catalog| {
+                catalog
+                    .scalar("SELECT count(*) FROM dl.main.orders")
+                    .ok()
+                    .flatten()
+            })
+    };
+    let errors: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+
+    // Run 1: one step, published, then checkpointed.
+    let controller = engine
+        .controller(
+            &circuit(),
+            &config,
+            Box::new({
+                let errors = errors.clone();
+                move |error, _| {
+                    errors
+                        .lock()
+                        .expect("the error list")
+                        .push(error.to_string())
+                }
+            }),
+        )
+        .expect("start the controller");
+    controller.start();
+    wait(
+        || {
+            count(&dir).as_deref() == Some("2")
+                || !errors.lock().expect("the error list").is_empty()
+        },
+        60_000,
+    )
+    .expect("the first step to be published");
+    assert!(
+        errors.lock().expect("the error list").is_empty(),
+        "the connector failed: {:?}",
+        errors.lock().expect("the error list")
+    );
+    let before = Catalog::open(&writer(&dir, "orders"))
+        .expect("reattach the catalog")
+        .frontier()
+        .expect("read the frontier");
+    controller.checkpoint().expect("a checkpoint");
+    controller.stop().expect("stop the controller");
+
+    // Run 2: the same storage and the same catalog.  The replay holds no rows —
+    // the checkpoint was taken after the step — so the only publication left is
+    // the one for the rows appended below.
+    let controller = engine
+        .controller(
+            &circuit(),
+            &config,
+            Box::new({
+                let errors = errors.clone();
+                move |error, _| {
+                    errors
+                        .lock()
+                        .expect("the error list")
+                        .push(error.to_string())
+                }
+            }),
+        )
+        .expect("restart the controller");
+    wait(|| !controller.is_replaying(), 60_000).expect("the replay to finish");
+    // The replay restores the circuit but starts nothing: a restarted pipeline is
+    // paused until it is started, so the input would never read the rows below.
+    controller.start();
+    append(&[3, 4]);
+    wait(
+        || {
+            count(&dir).as_deref() == Some("4")
+                || !errors.lock().expect("the error list").is_empty()
+        },
+        60_000,
+    )
+    .expect(
+        "the step after the restart to be published; a hold here means the restarted engine \
+         numbered its steps below the frontier the guard row already held",
+    );
+    assert!(
+        errors.lock().expect("the error list").is_empty(),
+        "the connector failed: {:?}",
+        errors.lock().expect("the error list")
+    );
+    let after = Catalog::open(&writer(&dir, "orders"))
+        .expect("reattach the catalog")
+        .frontier()
+        .expect("read the frontier");
+    controller.stop().expect("stop the controller");
+
+    assert!(
+        after > before,
+        "the frontier did not advance after the restart: {before} then {after}"
+    );
+    assert_eq!(
+        count(&dir).as_deref(),
+        Some("4"),
+        "the rows of both runs are in the catalog exactly once"
     );
 }
