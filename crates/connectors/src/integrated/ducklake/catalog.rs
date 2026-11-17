@@ -825,6 +825,26 @@ pub(crate) fn flattened(rows: Vec<Vec<Option<String>>>) -> Vec<String> {
         .collect()
 }
 
+/// A value that sorts deterministically against the tokens of other processes.
+///
+/// The order itself is arbitrary — two provisioned guard rows carry the same
+/// frontier and epoch, so keeping either is the same decision — but it has to be
+/// *total* and computable without coordination, because the repair is what stops
+/// two racing writers from leaving a catalog that every later open refuses.
+fn provisioning_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{nanos:032x}-{:08x}-{:08x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,24 +1014,4 @@ mod tests {
             "ducklake:/tmp/t.ducklake"
         );
     }
-}
-
-/// A value that sorts deterministically against the tokens of other processes.
-///
-/// The order itself is arbitrary — two provisioned guard rows carry the same
-/// frontier and epoch, so keeping either is the same decision — but it has to be
-/// *total* and computable without coordination, because the repair is what stops
-/// two racing writers from leaving a catalog that every later open refuses.
-fn provisioning_token() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "{nanos:032x}-{:08x}-{:08x}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )
 }
